@@ -1,7 +1,9 @@
 import os
 import uuid
+import re
+import unicodedata
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 from dotenv import load_dotenv
@@ -11,23 +13,66 @@ app = FastAPI()
 # Load environment variables from .env file
 load_dotenv()
 
-# CORS configuration
+# CORS configuration - Allow all for testing, restrict in production
 app.add_middleware(CORSMiddleware,
-    allow_origins=[os.getenv("ALLOWED_ORIGIN")],  # Adjust this to your needs
+    allow_origins=["*"],  # Allow all origins for now
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+def clean_filename(filename):
+    """Remove emojis and special characters from filename"""
+    # Normalize unicode characters
+    filename = unicodedata.normalize('NFKD', filename)
+    # Encode to ASCII, ignore characters that can't be converted
+    filename = filename.encode('ASCII', 'ignore').decode('ASCII')
+    # Replace any remaining non-alphanumeric characters with underscores
+    filename = re.sub(r'[^\w\s-]', '', filename)
+    # Replace spaces and dashes with underscores
+    filename = re.sub(r'[-\s]+', '_', filename)
+    # Remove leading/trailing underscores
+    filename = filename.strip('_')
+    # If filename is empty, use a default
+    if not filename:
+        filename = "video"
+    return filename
+
+@app.get("/info")
+async def get_video_info(url: str = Query(...)):
+    """Get video metadata without downloading"""
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            return {
+                "title": info.get("title", "Unknown"),
+                "thumbnail": info.get("thumbnail", ""),
+                "description": info.get("description", "")[:500],  # Limit description length
+                "duration": info.get("duration", 0),
+                "uploader": info.get("uploader", ""),
+                "view_count": info.get("view_count", 0),
+                "like_count": info.get("like_count", 0),
+            }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error fetching info: {str(e)}")
+
 @app.get("/download")
 async def download_video(url: str = Query(...), format: str = Query("best")):
     try:
-        # Extract metadata
-        with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True}) as ydl:
+        # First get metadata to get the clean title
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
             info = ydl.extract_info(url, download=False)
-            title = info.get("title", "video").replace("/", "-").replace("\\", "-")
-            extension = "mp4"  # fallback extension
-            filename = f"{title}.{extension}"
+            original_title = info.get("title", "video")
+            clean_title = clean_filename(original_title)
+            extension = "mp4"
+            filename = f"{clean_title}.{extension}"
 
         # Create a unique output template
         uid = uuid.uuid4().hex[:8]
@@ -37,14 +82,15 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
             'format': format,
             'outtmpl': output_template,
             'quiet': True,
+            'no_warnings': True,
             'merge_output_format': 'mp4',
         }
 
-        # Download the video using yt-dlp Python API
+        # Download the video
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            result = ydl.download([url])
+            ydl.download([url])
 
-        # Find actual downloaded file
+        # Find the downloaded file
         actual_file_path = None
         for f in os.listdir("/tmp"):
             if f.startswith(uid):
@@ -54,15 +100,19 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
         if not actual_file_path or not os.path.exists(actual_file_path):
             raise HTTPException(status_code=500, detail="Download failed or file not found.")
 
-        # Stream file
+        # Stream file with clean filename
         def iterfile():
             with open(actual_file_path, "rb") as f:
                 yield from f
-            os.unlink(actual_file_path)  # clean up after stream
+            # Clean up after streaming
+            try:
+                os.unlink(actual_file_path)
+            except:
+                pass
 
         return StreamingResponse(
             iterfile(),
-            media_type="application/octet-stream",
+            media_type="video/mp4",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
 
@@ -71,7 +121,18 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to the Social Media Video Downloader API. Use /download?url=<video_url>&format=<video_format> to download videos."}
+    return {
+        "message": "Welcome to the Social Media Video Downloader API.",
+        "endpoints": {
+            "/info": "GET video metadata (title, thumbnail, description)",
+            "/download": "GET download video file"
+        },
+        "usage": {
+            "info": "/info?url=<video_url>",
+            "download": "/download?url=<video_url>&format=<format>",
+            "formats": "best, best[height<=1080], best[height<=720], best[height<=360]"
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
