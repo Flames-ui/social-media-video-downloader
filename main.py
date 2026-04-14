@@ -3,7 +3,7 @@ import uuid
 import re
 import unicodedata
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 from dotenv import load_dotenv
@@ -54,7 +54,7 @@ async def get_video_info(url: str = Query(...)):
             return {
                 "title": info.get("title", "Unknown"),
                 "thumbnail": info.get("thumbnail", ""),
-                "description": info.get("description", "")[:500],  # Limit description length
+                "description": info.get("description", "")[:500],
                 "duration": info.get("duration", 0),
                 "uploader": info.get("uploader", ""),
                 "view_count": info.get("view_count", 0),
@@ -78,12 +78,25 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
         uid = uuid.uuid4().hex[:8]
         output_template = f"/tmp/{uid}.%(ext)s"
 
+        # FIXED: Smart format selection with fallback
+        if format == "best":
+            format_string = "best[ext=mp4]/best"
+        elif format == "hd":
+            format_string = "best[height<=720]/best[ext=mp4]/best"
+        elif format == "sd":
+            format_string = "best[height<=480]/best[ext=mp4]/best"
+        elif format == "audio":
+            format_string = "bestaudio/best"
+        else:
+            format_string = format
+
         ydl_opts = {
-            'format': format,
+            'format': format_string,
             'outtmpl': output_template,
             'quiet': True,
             'no_warnings': True,
             'merge_output_format': 'mp4',
+            'ignoreerrors': True,  # Skip unavailable formats
         }
 
         # Download the video
@@ -130,7 +143,7 @@ async def root():
         "usage": {
             "info": "/info?url=<video_url>",
             "download": "/download?url=<video_url>&format=<format>",
-            "formats": "best, best[height<=1080], best[height<=720], best[height<=360]"
+            "formats": "best, hd, sd, audio"
         }
     }
 
