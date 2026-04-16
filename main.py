@@ -107,13 +107,13 @@ WRESTLER_USERNAMES = [
     "youngbucks",                # The Young Bucks
 ]
 
-# Hashtags to search
+# Hashtags to search (KEPT FOR REFERENCE - NOT USED DUE TO TIKTOK BLOCKING)
 WWE_HASHTAGS = [
     # General WWE
     "WWE", "ObaFemi", "RomanReigns", "WWENXT", "SmackDown",
     "WWERaw", "SummerSlam", "RoyalRumble", "MITB", "SurvivorSeries",
     "CodyRhodes", "RheaRipley", "BiancaBelair", "SethRollins", "TiffanyStratton", "LAKnight",
-    # WrestleMania 42 Specific (CRITICAL FOR NEXT 2 WEEKS)
+    # WrestleMania 42 Specific
     "WrestleMania42", "WM42", "WrestleMania",
     "WrestleManiaWeek", "WM42Predictions", "WM42Results",
     "WM42Highlights", "WrestleManiaHighlights", "WM42Press",
@@ -303,32 +303,18 @@ async def fetch_videos_for_platform(platform: str, limit: int = 15):
     }
 
     all_videos = []
-    hashtags = WWE_HASHTAGS if platform == "wwe" else AEW_HASHTAGS
     official_accounts = OFFICIAL_ACCOUNTS.get(platform, [])
 
-    # PRIORITY: WrestleMania 42 hashtags first (if WWE platform)
-    wm42_tags = [tag for tag in hashtags if "WM42" in tag or "WrestleMania42" in tag or "WrestleMania" in tag]
-    other_tags = [tag for tag in hashtags if tag not in wm42_tags]
-    priority_tags = wm42_tags[:6] + other_tags[:4]  # 6 WM42 tags + 4 regular
+    # ============================================
+    # METHOD 1: HASHTAGS - DISABLED DUE TO TIKTOK BLOCKING
+    # ============================================
+    # TikTok changed their page structure. Hashtag extraction no longer works.
+    # This section is intentionally skipped to prevent deployment errors.
+    # ============================================
 
-    # Method 1: Search by hashtags (WM42 priority)
-    for tag in priority_tags[:10]:
-        try:
-            search_url = f"https://www.tiktok.com/tag/{tag.replace('#', '')}"
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(search_url, download=False)
-
-                for entry in info.get('entries', [])[:5]:
-                    if entry:
-                        video_data = await process_video_entry(entry, platform, [tag])
-                        if video_data:
-                            all_videos.append(video_data)
-
-        except Exception as e:
-            print(f"Error fetching hashtag {tag}: {e}")
-
-    # Method 2: Fetch from official accounts
+    # ============================================
+    # METHOD 2: FETCH FROM OFFICIAL ACCOUNTS (WORKING)
+    # ============================================
     for account in official_accounts[:4]:
         try:
             account_url = f"https://www.tiktok.com/@{account.replace('@', '')}"
@@ -345,7 +331,9 @@ async def fetch_videos_for_platform(platform: str, limit: int = 15):
         except Exception as e:
             print(f"Error fetching account {account}: {e}")
 
-    # Method 3: Search for wrestler usernames (WM42 wrestlers first)
+    # ============================================
+    # METHOD 3: SEARCH FOR WRESTLER USERNAMES (WORKING)
+    # ============================================
     wm42_wrestlers = ["codyrhodes", "romanreigns", "rhearipley", "sethrollins", "laknight", "loganpaul", "bayley", "iyosky", "samizayn", "kevinowens", "drewmcintyre", "cmpunk"]
     other_wrestlers = [w for w in WRESTLER_USERNAMES if w not in wm42_wrestlers]
     priority_wrestlers = wm42_wrestlers[:8] + other_wrestlers[:4]
@@ -366,7 +354,9 @@ async def fetch_videos_for_platform(platform: str, limit: int = 15):
         except Exception as e:
             print(f"Error searching wrestler {wrestler}: {e}")
 
-    # Method 4: Fetch from wrestling creator accounts (only for WWE)
+    # ============================================
+    # METHOD 4: FETCH FROM WRESTLING CREATOR ACCOUNTS (WORKING)
+    # ============================================
     if platform == "wwe":
         for creator in WRESTLING_CREATORS[:6]:
             try:
@@ -774,7 +764,8 @@ async def root():
         "auto_fetch": {
             "interval": "2 minutes",
             "status": "active",
-            "wrestlemania_42_mode": "ENABLED - Priority Fetching Active"
+            "wrestlemania_42_mode": "ENABLED",
+            "note": "Hashtag search temporarily disabled due to TikTok changes. Using official accounts, wrestler searches, and creator accounts."
         }
     }
 
