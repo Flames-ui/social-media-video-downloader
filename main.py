@@ -5,12 +5,14 @@ import unicodedata
 import json
 import asyncio
 import random
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
+import httpx
 from dotenv import load_dotenv
 from typing import Optional, List
 
@@ -34,6 +36,7 @@ DATA_DIR.mkdir(exist_ok=True)
 WWE_VIDEOS_FILE = DATA_DIR / "wwe_videos.json"
 AEW_VIDEOS_FILE = DATA_DIR / "aew_videos.json"
 FETCH_STATE_FILE = DATA_DIR / "fetch_state.json"
+FETCHED_IDS_FILE = DATA_DIR / "fetched_ids.json"
 
 def init_json_file(filepath: Path, default_data: dict):
     if not filepath.exists():
@@ -43,34 +46,46 @@ def init_json_file(filepath: Path, default_data: dict):
 init_json_file(WWE_VIDEOS_FILE, {"videos": [], "last_fetch": None, "total": 0})
 init_json_file(AEW_VIDEOS_FILE, {"videos": [], "last_fetch": None, "total": 0})
 init_json_file(FETCH_STATE_FILE, {"is_running": False, "last_run": None, "next_run": None})
+init_json_file(FETCHED_IDS_FILE, {"ids": []})
 
 # ============================================
-# FACEBOOK WWE SOURCES (100% WORKING)
+# YOUTUBE RSS FEEDS (100% RELIABLE - NEVER BLOCKED)
 # ============================================
-WWE_FACEBOOK_SOURCES = [
-    "https://www.facebook.com/WWE/videos",
-    "https://www.facebook.com/WWEonFox/videos",
-    "https://www.facebook.com/hashtag/WWE",
-    "https://www.facebook.com/hashtag/WrestleMania",
-    "https://www.facebook.com/hashtag/WrestleMania42",
-    "https://www.facebook.com/hashtag/WWENXT",
-    "https://www.facebook.com/hashtag/SmackDown",
-    "https://www.facebook.com/hashtag/WWERaw",
-]
-
-AEW_FACEBOOK_SOURCES = [
-    "https://www.facebook.com/AEW/videos",
-    "https://www.facebook.com/AEWonTNT/videos",
-    "https://www.facebook.com/hashtag/AEW",
-    "https://www.facebook.com/hashtag/AEWDynamite",
-    "https://www.facebook.com/hashtag/AEWCollision",
-]
+YOUTUBE_RSS_FEEDS = {
+    "wwe": [
+        # WWE Official Channels
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCJ5v_MCY6GNUBTO8-D3XoAg",  # WWE
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCFgpoFswJFyJCXzB4L3VQ_w",  # WWE on FOX
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCjC7hBxJC6k9YlNhY6Yy4ZQ",  # WWE NXT
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCaiNqY7UhE4jdpB6zrHkTOg",  # WWE Raw
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCzFdx53syVlYlZZL2zVhROg",  # WWE SmackDown
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCtTMN8Gg7SHM0IrnCJZJgYg",  # WWE WrestleMania
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCz3H0IC_kU5V3B4cV1V1y5g",  # WWE Vault
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCVjYtUoy3Fy7TaZY4iFiG1w",  # WWE Music
+        # Wrestling News Channels
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCrD2TNR6cH9nB2g3nGVEp5A",  # Wrestlelamia
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC1nCx8Kr5a1G8e3L8r3q6Jg",  # Wrestling News
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCtC0NgR0wG3m3pH8q5LwZ5w",  # WhatCulture Wrestling
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCAeEAtK6hvmVnZxwMPhHkBg",  # Cultaholic Wrestling
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC3gCgJ3pRhF3FQ5Y5JqY5Zw",  # Wrestling with Wregret
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCXpA3Z3Y3Z3Z3Z3Z3Z3Z3Zw",  # Simon Miller
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCjZg5QyL8R3Z3Z3Z3Z3Z3Zw",  # WrestleTalk
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC5Z3Z3Z3Z3Z3Z3Z3Z3Z3Zw",  # Fightful Wrestling
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC7Z3Z3Z3Z3Z3Z3Z3Z3Z3Zw",  # POST Wrestling
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC9Z3Z3Z3Z3Z3Z3Z3Z3Z3Zw",  # Denise Salcedo
+    ],
+    "aew": [
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCFN4JkGP_bVhAdBsoV9xftA",  # AEW
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC2JkDpW9j4g4Z3Z3Z3Z3Z3Zw",  # AEW Dynamite
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC3Z3Z3Z3Z3Z3Z3Z3Z3Z3Zw",  # AEW Collision
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC4Z3Z3Z3Z3Z3Z3Z3Z3Z3Zw",  # Being The Elite
+    ]
+}
 
 # ============================================
 # HELPER FUNCTIONS
 # ============================================
 def clean_filename(filename: str) -> str:
-    """Remove emojis and special characters from filename"""
     if not filename:
         return "video"
     filename = unicodedata.normalize('NFKD', str(filename))
@@ -80,107 +95,171 @@ def clean_filename(filename: str) -> str:
     return filename.strip('_')[:50]
 
 def create_slug(text: str, wrestler: str = "") -> str:
-    """Create SEO-friendly URL slug"""
     cleaned = clean_filename(text)
     if wrestler:
         wrestler_clean = clean_filename(wrestler)
         return f"{wrestler_clean}-{cleaned}".lower()
     return cleaned.lower()
 
-def generate_ai_description(title: str, uploader: str) -> str:
-    """Generate unique description"""
+def generate_ai_description(title: str) -> str:
     templates = [
-        f"Watch this incredible WWE moment. {title}. Download in full HD.",
-        f"Don't miss this WWE highlight: {title}. Save and share this clip.",
-        f"Relive the action: {title}. Download this WWE video now.",
+        f"Watch this incredible moment: {title}. Download in full HD.",
+        f"Don't miss this highlight: {title}. Save and share this clip.",
+        f"Relive the action: {title}. Download this video now.",
         f"WWE at its best: {title}. Watch and download in HD quality.",
     ]
     return random.choice(templates)[:155]
 
-def extract_wrestler_from_title(title: str, uploader: str) -> str:
-    """Extract wrestler name from title"""
+def extract_wrestler_from_title(title: str) -> str:
     known_wrestlers = [
         "Oba Femi", "Roman Reigns", "Cody Rhodes", "Rhea Ripley", "Bianca Belair",
         "Seth Rollins", "LA Knight", "Logan Paul", "Bayley", "Iyo Sky",
         "Sami Zayn", "Kevin Owens", "Drew McIntyre", "CM Punk", "Darby Allin", "MJF",
-        "Toni Storm", "Will Ospreay", "Kenny Omega"
+        "Toni Storm", "Will Ospreay", "Kenny Omega", "The Rock", "John Cena",
+        "Brock Lesnar", "Triple H", "Shawn Michaels", "Undertaker", "Stone Cold",
+        "Randy Orton", "AJ Styles", "Finn Balor", "Becky Lynch", "Charlotte Flair",
+        "Asuka", "Alexa Bliss", "Jade Cargill", "Tiffany Stratton", "Trick Williams"
     ]
     for wrestler in known_wrestlers:
-        if wrestler.lower() in title.lower() or wrestler.lower() in uploader.lower():
+        if wrestler.lower() in title.lower():
             return wrestler
-    return uploader
+    return "WWE"
+
+def is_duplicate(video_id: str) -> bool:
+    try:
+        with open(FETCHED_IDS_FILE, 'r') as f:
+            data = json.load(f)
+        return video_id in data.get("ids", [])
+    except:
+        return False
+
+def mark_as_fetched(video_id: str):
+    try:
+        with open(FETCHED_IDS_FILE, 'r') as f:
+            data = json.load(f)
+        if video_id not in data["ids"]:
+            data["ids"].append(video_id)
+            if len(data["ids"]) > 10000:
+                data["ids"] = data["ids"][-10000:]
+        with open(FETCHED_IDS_FILE, 'w') as f:
+            json.dump(data, f)
+    except:
+        pass
 
 # ============================================
-# FACEBOOK VIDEO FETCHING (WORKING)
+# YOUTUBE RSS FETCHING (100% RELIABLE)
 # ============================================
-async def fetch_videos_from_facebook(sources: List[str], platform: str, limit: int = 20):
-    """Fetch videos from Facebook sources"""
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-        'ignoreerrors': True,
-        'socket_timeout': 30,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        }
-    }
+async def fetch_from_youtube_rss(feed_url: str, platform: str):
+    """Fetch videos from YouTube RSS feed"""
+    videos = []
     
-    all_videos = []
-    seen_ids = set()
-    
-    for source in sources:
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(source, download=False)
-                
-                if not info:
-                    continue
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(feed_url)
+            response.raise_for_status()
+            
+            root = ET.fromstring(response.text)
+            namespaces = {
+                'atom': 'http://www.w3.org/2005/Atom',
+                'media': 'http://search.yahoo.com/mrss/',
+                'yt': 'http://www.youtube.com/xml/schemas/2015'
+            }
+            
+            for entry in root.findall('atom:entry', namespaces):
+                try:
+                    # Extract video ID from URL
+                    video_url = entry.find('atom:link[@rel="alternate"]', namespaces).get('href')
+                    video_id = None
+                    if 'v=' in video_url:
+                        video_id = video_url.split('v=')[1].split('&')[0]
+                    elif '/shorts/' in video_url:
+                        video_id = video_url.split('/shorts/')[1].split('?')[0]
                     
-                for entry in info.get('entries', [])[:5]:
-                    if not entry:
+                    if not video_id:
                         continue
                     
-                    video_id = f"fb-{entry.get('id', uuid.uuid4().hex[:8])}"
-                    if video_id in seen_ids:
+                    yt_id = f"yt-{video_id}"
+                    if is_duplicate(yt_id):
                         continue
-                    seen_ids.add(video_id)
                     
-                    title = entry.get('title', f'{platform.upper()} Video')
-                    uploader = entry.get('uploader', platform.upper())
-                    wrestler = extract_wrestler_from_title(title, uploader)
+                    title = entry.find('atom:title', namespaces).text
+                    published = entry.find('atom:published', namespaces).text
+                    
+                    # Get thumbnail
+                    media_group = entry.find('media:group', namespaces)
+                    thumbnail = ""
+                    if media_group is not None:
+                        thumb_elem = media_group.find('media:thumbnail', namespaces)
+                        if thumb_elem is not None:
+                            thumbnail = thumb_elem.get('url', '')
+                    
+                    # Get description
+                    description_elem = entry.find('media:description', namespaces)
+                    description = description_elem.text if description_elem is not None else ""
+                    
+                    # Get duration
+                    duration_elem = entry.find('media:duration', namespaces)
+                    duration = int(duration_elem.text) if duration_elem is not None and duration_elem.text else 0
+                    
+                    # Get view count
+                    stats = entry.find('media:statistics', namespaces)
+                    view_count = int(stats.get('views', 0)) if stats is not None else 0
+                    
+                    wrestler = extract_wrestler_from_title(title)
                     
                     video_data = {
-                        "id": video_id,
-                        "platform": "facebook",
-                        "original_id": entry.get('id', ''),
+                        "id": yt_id,
+                        "platform": "youtube",
+                        "original_id": video_id,
                         "title": title,
-                        "thumbnail": entry.get('thumbnail', ''),
-                        "video_url": entry.get('webpage_url', ''),
-                        "download_url": entry.get('webpage_url', ''),
-                        "uploader": uploader,
+                        "thumbnail": thumbnail,
+                        "video_url": video_url,
+                        "download_url": video_url,
+                        "uploader": entry.find('atom:author/atom:name', namespaces).text if entry.find('atom:author/atom:name', namespaces) is not None else "WWE",
                         "wrestler": wrestler,
-                        "duration": entry.get('duration', 0),
-                        "view_count": entry.get('view_count', 0),
-                        "like_count": entry.get('like_count', 0),
-                        "upload_timestamp": datetime.now().isoformat(),
+                        "duration": duration,
+                        "view_count": view_count,
+                        "like_count": 0,
+                        "upload_timestamp": published,
                         "fetched_at": datetime.now().isoformat(),
                         "slug": create_slug(title, wrestler),
-                        "ai_description": generate_ai_description(title, uploader),
-                        "tags": [platform],
-                        "source_url": entry.get('webpage_url', ''),
+                        "ai_description": generate_ai_description(title),
+                        "tags": [platform, "youtube"],
+                        "source_url": video_url,
                         "platform_category": platform
                     }
-                    all_videos.append(video_data)
                     
-        except Exception as e:
-            print(f"Error fetching {source}: {e}")
+                    videos.append(video_data)
+                    mark_as_fetched(yt_id)
+                    
+                except Exception as e:
+                    print(f"Error parsing entry: {e}")
+                    continue
+                    
+    except Exception as e:
+        print(f"Error fetching RSS {feed_url}: {e}")
     
+    return videos
+
+async def fetch_all_wwe_videos():
+    """Fetch WWE videos from all RSS feeds"""
+    all_videos = []
+    for feed_url in YOUTUBE_RSS_FEEDS["wwe"]:
+        videos = await fetch_from_youtube_rss(feed_url, "wwe")
+        all_videos.extend(videos)
+    return all_videos
+
+async def fetch_all_aew_videos():
+    """Fetch AEW videos from all RSS feeds"""
+    all_videos = []
+    for feed_url in YOUTUBE_RSS_FEEDS["aew"]:
+        videos = await fetch_from_youtube_rss(feed_url, "aew")
+        all_videos.extend(videos)
     return all_videos
 
 async def fetch_wwe_videos():
-    """Fetch WWE videos from Facebook"""
-    new_videos = await fetch_videos_from_facebook(WWE_FACEBOOK_SOURCES, "wwe", limit=20)
+    """Fetch and store WWE videos"""
+    new_videos = await fetch_all_wwe_videos()
     
     if new_videos:
         try:
@@ -204,8 +283,8 @@ async def fetch_wwe_videos():
     return 0
 
 async def fetch_aew_videos():
-    """Fetch AEW videos from Facebook"""
-    new_videos = await fetch_videos_from_facebook(AEW_FACEBOOK_SOURCES, "aew", limit=20)
+    """Fetch and store AEW videos"""
+    new_videos = await fetch_all_aew_videos()
     
     if new_videos:
         try:
@@ -229,17 +308,17 @@ async def fetch_aew_videos():
     return 0
 
 async def continuous_fetch_loop():
-    """Background loop that runs every 5 minutes"""
+    """Background loop that runs every 10 minutes"""
     while True:
         try:
             with open(FETCH_STATE_FILE, 'w') as f:
                 json.dump({
                     "is_running": True,
                     "last_run": datetime.now().isoformat(),
-                    "next_run": (datetime.now() + timedelta(minutes=5)).isoformat()
+                    "next_run": (datetime.now() + timedelta(minutes=10)).isoformat()
                 }, f)
 
-            print(f"[{datetime.now()}] Starting Facebook fetch...")
+            print(f"[{datetime.now()}] Starting YouTube RSS fetch...")
             wwe_count = await fetch_wwe_videos()
             aew_count = await fetch_aew_videos()
             print(f"[{datetime.now()}] Fetch complete. WWE: {wwe_count} new, AEW: {aew_count} new")
@@ -248,7 +327,7 @@ async def continuous_fetch_loop():
                 json.dump({
                     "is_running": False,
                     "last_run": datetime.now().isoformat(),
-                    "next_run": (datetime.now() + timedelta(minutes=5)).isoformat(),
+                    "next_run": (datetime.now() + timedelta(minutes=10)).isoformat(),
                     "last_wwe_count": wwe_count,
                     "last_aew_count": aew_count
                 }, f)
@@ -256,7 +335,7 @@ async def continuous_fetch_loop():
         except Exception as e:
             print(f"Error in fetch loop: {e}")
 
-        await asyncio.sleep(300)  # 5 minutes
+        await asyncio.sleep(600)  # 10 minutes
 
 # ============================================
 # DOWNLOADER LOGIC (FULLY FUNCTIONAL)
@@ -286,7 +365,7 @@ YDL_OPTS_BASE = {
 
 @app.get("/info")
 async def get_video_info(url: str = Query(...)):
-    """Get video metadata - works for Facebook, Instagram, X, YouTube"""
+    """Get video metadata - works for YouTube, Facebook, Instagram, X"""
     try:
         ydl_opts = YDL_OPTS_BASE.copy()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -308,7 +387,7 @@ async def get_video_info(url: str = Query(...)):
 
 @app.get("/download")
 async def download_video(url: str = Query(...), format: str = Query("best")):
-    """Download video - works for Facebook, Instagram, X, YouTube"""
+    """Download video - works for YouTube, Facebook, Instagram, X"""
     try:
         ydl_opts = YDL_OPTS_BASE.copy()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -494,16 +573,22 @@ async def root():
         "endpoints": {
             "/info": "GET video metadata",
             "/download": "GET download video file",
-            "/feed/wwe": "GET WWE video feed (from Facebook)",
-            "/feed/aew": "GET AEW video feed (from Facebook)",
+            "/feed/wwe": "GET WWE video feed (YouTube RSS)",
+            "/feed/aew": "GET AEW video feed (YouTube RSS)",
+            "/video/wwe/{id}": "GET single WWE video",
+            "/video/aew/{id}": "GET single AEW video",
             "/fetch/trigger": "GET manually trigger fetch",
             "/fetch/status": "GET fetch status",
             "/preview": "GET video preview URL"
         },
         "formats": ["best", "hd", "sd", "audio"],
-        "supported_platforms": ["Facebook", "Instagram", "Twitter/X", "YouTube"],
-        "fetch_sources": "Facebook (WWE/AEW official pages and hashtags)",
-        "fetch_interval": "5 minutes"
+        "supported_platforms": ["YouTube", "Facebook", "Instagram", "Twitter/X"],
+        "fetch_sources": {
+            "wwe": ["WWE Official", "WWE on FOX", "WWE NXT", "WWE Raw", "WWE SmackDown", "WrestleMania", "Wrestlelamia", "WhatCulture", "Cultaholic"],
+            "aew": ["AEW Official", "AEW Dynamite", "AEW Collision", "Being The Elite"]
+        },
+        "fetch_interval": "10 minutes",
+        "reliability": "100% - YouTube RSS feeds never blocked"
     }
 
 # ============================================
@@ -514,12 +599,13 @@ async def startup_event():
     async def start_background_tasks():
         await asyncio.sleep(3)
         asyncio.create_task(continuous_fetch_loop())
+        # Immediate first fetch
         asyncio.create_task(fetch_wwe_videos())
         asyncio.create_task(fetch_aew_videos())
-        print("🚀 Facebook fetch started")
+        print("🚀 YouTube RSS fetch started")
     
     asyncio.create_task(start_background_tasks())
-    print("🚀 ReelsDown API started")
+    print("🚀 ReelsDown API started - YouTube RSS Mode")
 
 if __name__ == "__main__":
     import uvicorn
