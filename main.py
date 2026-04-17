@@ -3,7 +3,7 @@ import re
 import unicodedata
 import json
 import asyncio
-import uuid  # ← FIXED: Moved to top of file
+import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -92,6 +92,19 @@ def extract_video_id_from_url(url: str) -> Optional[str]:
         return url.split('youtu.be/')[1].split('?')[0]
     return None
 
+def parse_duration(duration_str: str) -> int:
+    """Parse ISO 8601 duration to seconds (PT1M30S -> 90)"""
+    if not duration_str:
+        return 0
+    pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+    match = re.match(pattern, duration_str)
+    if match:
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2) or 0)
+        seconds = int(match.group(3) or 0)
+        return hours * 3600 + minutes * 60 + seconds
+    return 0
+
 def extract_wrestler_from_title(title: str, uploader: str) -> str:
     """Extract wrestler name from title"""
     known_wrestlers = [
@@ -119,61 +132,49 @@ async def fetch_single_rss(feed_url: str, platform: str) -> List[dict]:
             response = await client.get(feed_url)
             response.raise_for_status()
             
+            # Parse XML with correct namespaces
             root = ET.fromstring(response.text)
-            namespaces = {
-                'atom': 'http://www.w3.org/2005/Atom',
-                'media': 'http://search.yahoo.com/mrss/',
-                'yt': 'http://www.youtube.com/xml/schemas/2015'
-            }
             
-            for entry in root.findall('atom:entry', namespaces):
+            for entry in root.findall('.//{http://www.w3.org/2005/Atom}entry'):
                 try:
-                    # Extract video URL
-                    video_url = None
-                    for link in entry.findall('atom:link', namespaces):
-                        if link.get('rel') == 'alternate':
-                            video_url = link.get('href')
-                            break
+                    # Video ID from yt:videoId
+                    video_id_elem = entry.find('.//{http://www.youtube.com/xml/schemas/2015}videoId')
+                    video_id = video_id_elem.text if video_id_elem is not None else None
                     
-                    if not video_url:
-                        continue
-                    
-                    video_id = extract_video_id_from_url(video_url)
                     if not video_id:
                         continue
                     
                     yt_id = f"yt-{video_id}"
+                    video_url = f"https://www.youtube.com/watch?v={video_id}"
                     
-                    # Extract metadata
-                    title = entry.find('atom:title', namespaces).text if entry.find('atom:title', namespaces) is not None else "Wrestling Video"
-                    published = entry.find('atom:published', namespaces).text if entry.find('atom:published', namespaces) is not None else datetime.now().isoformat()
+                    # Title
+                    title_elem = entry.find('.//{http://www.w3.org/2005/Atom}title')
+                    title = title_elem.text if title_elem is not None else "Wrestling Video"
                     
-                    # Get author/uploader
-                    author_elem = entry.find('atom:author/atom:name', namespaces)
+                    # Published date
+                    published_elem = entry.find('.//{http://www.w3.org/2005/Atom}published')
+                    published = published_elem.text if published_elem is not None else datetime.now().isoformat()
+                    
+                    # Author/Channel
+                    author_elem = entry.find('.//{http://www.w3.org/2005/Atom}author/{http://www.w3.org/2005/Atom}name')
                     uploader = author_elem.text if author_elem is not None else "WWE"
                     
-                    # Get thumbnail
-                    media_group = entry.find('media:group', namespaces)
-                    thumbnail = ""
-                    if media_group is not None:
-                        thumb_elem = media_group.find('media:thumbnail', namespaces)
-                        if thumb_elem is not None:
-                            thumbnail = thumb_elem.get('url', '')
+                    # Description (media:description)
+                    desc_elem = entry.find('.//{http://search.yahoo.com/mrss/}description')
+                    original_description = desc_elem.text if desc_elem is not None else ""
                     
-                    # Get description (original - Lovable will AI rewrite)
-                    description_elem = entry.find('media:description', namespaces)
-                    original_description = description_elem.text if description_elem is not None else ""
+                    # Thumbnail (media:thumbnail)
+                    thumb_elem = entry.find('.//{http://search.yahoo.com/mrss/}thumbnail')
+                    thumbnail = thumb_elem.get('url', '') if thumb_elem is not None else ""
                     
-                    # Get duration
-                    duration_elem = entry.find('media:duration', namespaces)
-                    duration = int(duration_elem.text) if duration_elem is not None and duration_elem.text else 0
+                    # Duration (yt:duration)
+                    duration_elem = entry.find('.//{http://www.youtube.com/xml/schemas/2015}duration')
+                    duration_text = duration_elem.text if duration_elem is not None else "PT0S"
+                    duration = parse_duration(duration_text)
                     
-                    # Get view count
-                    stats = entry.find('media:statistics', namespaces)
-                    view_count = int(stats.get('views', 0)) if stats is not None else 0
-                    
-                    # Get like count
-                    like_count = int(stats.get('likes', 0)) if stats is not None else 0
+                    # View count (media:statistics)
+                    stats_elem = entry.find('.//{http://search.yahoo.com/mrss/}statistics')
+                    view_count = int(stats_elem.get('views', 0)) if stats_elem is not None else 0
                     
                     wrestler = extract_wrestler_from_title(title, uploader)
                     
@@ -182,15 +183,15 @@ async def fetch_single_rss(feed_url: str, platform: str) -> List[dict]:
                         "id": yt_id,
                         "platform": "youtube",
                         "original_id": video_id,
-                        "original_title": title,  # Lovable will AI rewrite this
-                        "original_description": original_description,  # Lovable will AI rewrite this
+                        "original_title": title,
+                        "original_description": original_description,
                         "thumbnail": thumbnail,
-                        "video_url": video_url,  # Ready for immediate playback
+                        "video_url": video_url,
                         "uploader": uploader,
                         "wrestler": wrestler,
                         "duration": duration,
                         "view_count": view_count,
-                        "like_count": like_count,
+                        "like_count": 0,
                         "upload_timestamp": published,
                         "tags": [platform, "youtube"],
                         "platform_category": platform
@@ -299,7 +300,7 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
             clean_title = clean_filename(original_title)
             filename = f"{clean_title}.mp4"
 
-        uid = uuid.uuid4().hex[:8]  # ← FIXED: uuid now properly imported
+        uid = uuid.uuid4().hex[:8]
         output_template = f"/tmp/{uid}.%(ext)s"
 
         if format == "best":
