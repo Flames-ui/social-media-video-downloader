@@ -3,6 +3,7 @@ import re
 import unicodedata
 import json
 import asyncio
+import uuid  # ← FIXED: Moved to top of file
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -298,8 +299,7 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
             clean_title = clean_filename(original_title)
             filename = f"{clean_title}.mp4"
 
-        import uuid
-        uid = uuid.uuid4().hex[:8]
+        uid = uuid.uuid4().hex[:8]  # ← FIXED: uuid now properly imported
         output_template = f"/tmp/{uid}.%(ext)s"
 
         if format == "best":
