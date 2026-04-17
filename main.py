@@ -92,19 +92,6 @@ def extract_video_id_from_url(url: str) -> Optional[str]:
         return url.split('youtu.be/')[1].split('?')[0]
     return None
 
-def parse_duration(duration_str: str) -> int:
-    """Parse ISO 8601 duration to seconds (PT1M30S -> 90)"""
-    if not duration_str:
-        return 0
-    pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
-    match = re.match(pattern, duration_str)
-    if match:
-        hours = int(match.group(1) or 0)
-        minutes = int(match.group(2) or 0)
-        seconds = int(match.group(3) or 0)
-        return hours * 3600 + minutes * 60 + seconds
-    return 0
-
 def extract_wrestler_from_title(title: str, uploader: str) -> str:
     """Extract wrestler name from title"""
     known_wrestlers = [
@@ -121,7 +108,7 @@ def extract_wrestler_from_title(title: str, uploader: str) -> str:
     return uploader
 
 # ============================================
-# YOUTUBE RSS FETCHING (RAW DATA ONLY)
+# YOUTUBE RSS FETCHING (SOLUTION 1: NAMESPACE DICTIONARY)
 # ============================================
 async def fetch_single_rss(feed_url: str, platform: str) -> List[dict]:
     """Fetch raw videos from a single YouTube RSS feed"""
@@ -132,53 +119,69 @@ async def fetch_single_rss(feed_url: str, platform: str) -> List[dict]:
             response = await client.get(feed_url)
             response.raise_for_status()
             
-            # Parse XML with correct namespaces
+            # Parse XML
             root = ET.fromstring(response.text)
             
-            for entry in root.findall('.//{http://www.w3.org/2005/Atom}entry'):
+            # SOLUTION 1: Define and use namespaces properly
+            namespaces = {
+                'atom': 'http://www.w3.org/2005/Atom',
+                'yt': 'http://www.youtube.com/xml/schemas/2015',
+                'media': 'http://search.yahoo.com/mrss/'
+            }
+            
+            # Use 'atom:entry' with the namespaces dictionary
+            entries = root.findall('atom:entry', namespaces)
+            print(f"Found {len(entries)} entries in feed")
+            
+            for entry in entries:
                 try:
-                    # Video ID from yt:videoId
-                    video_id_elem = entry.find('.//{http://www.youtube.com/xml/schemas/2015}videoId')
-                    video_id = video_id_elem.text if video_id_elem is not None else None
-                    
-                    if not video_id:
+                    # Video ID - using yt namespace
+                    video_id_elem = entry.find('yt:videoId', namespaces)
+                    if video_id_elem is None:
                         continue
+                    video_id = video_id_elem.text
                     
                     yt_id = f"yt-{video_id}"
                     video_url = f"https://www.youtube.com/watch?v={video_id}"
                     
-                    # Title
-                    title_elem = entry.find('.//{http://www.w3.org/2005/Atom}title')
+                    # Title - using atom namespace
+                    title_elem = entry.find('atom:title', namespaces)
                     title = title_elem.text if title_elem is not None else "Wrestling Video"
                     
-                    # Published date
-                    published_elem = entry.find('.//{http://www.w3.org/2005/Atom}published')
+                    # Published date - using atom namespace
+                    published_elem = entry.find('atom:published', namespaces)
                     published = published_elem.text if published_elem is not None else datetime.now().isoformat()
                     
-                    # Author/Channel
-                    author_elem = entry.find('.//{http://www.w3.org/2005/Atom}author/{http://www.w3.org/2005/Atom}name')
+                    # Author/Channel - using atom namespace
+                    author_elem = entry.find('atom:author/atom:name', namespaces)
                     uploader = author_elem.text if author_elem is not None else "WWE"
                     
-                    # Description (media:description)
-                    desc_elem = entry.find('.//{http://search.yahoo.com/mrss/}description')
+                    # Description - using media namespace
+                    desc_elem = entry.find('media:group/media:description', namespaces)
+                    if desc_elem is None:
+                        desc_elem = entry.find('.//media:description', namespaces)
                     original_description = desc_elem.text if desc_elem is not None else ""
                     
-                    # Thumbnail (media:thumbnail)
-                    thumb_elem = entry.find('.//{http://search.yahoo.com/mrss/}thumbnail')
+                    # Thumbnail - using media namespace
+                    thumb_elem = entry.find('media:group/media:thumbnail', namespaces)
+                    if thumb_elem is None:
+                        thumb_elem = entry.find('.//media:thumbnail', namespaces)
                     thumbnail = thumb_elem.get('url', '') if thumb_elem is not None else ""
                     
-                    # Duration (yt:duration)
-                    duration_elem = entry.find('.//{http://www.youtube.com/xml/schemas/2015}duration')
-                    duration_text = duration_elem.text if duration_elem is not None else "PT0S"
-                    duration = parse_duration(duration_text)
+                    # Duration - using yt namespace (in seconds)
+                    duration_elem = entry.find('media:group/yt:duration', namespaces)
+                    if duration_elem is None:
+                        duration_elem = entry.find('.//yt:duration', namespaces)
+                    duration = int(duration_elem.text) if duration_elem is not None and duration_elem.text else 0
                     
-                    # View count (media:statistics)
-                    stats_elem = entry.find('.//{http://search.yahoo.com/mrss/}statistics')
+                    # View count - using media namespace
+                    stats_elem = entry.find('media:group/media:community/media:statistics', namespaces)
+                    if stats_elem is None:
+                        stats_elem = entry.find('.//media:statistics', namespaces)
                     view_count = int(stats_elem.get('views', 0)) if stats_elem is not None else 0
                     
                     wrestler = extract_wrestler_from_title(title, uploader)
                     
-                    # Raw video object - Lovable will AI rewrite and save to Supabase
                     video_data = {
                         "id": yt_id,
                         "platform": "youtube",
@@ -198,6 +201,7 @@ async def fetch_single_rss(feed_url: str, platform: str) -> List[dict]:
                     }
                     
                     videos.append(video_data)
+                    print(f"✅ Parsed: {title[:50]}")
                     
                 except Exception as e:
                     print(f"Error parsing entry: {e}")
@@ -206,6 +210,7 @@ async def fetch_single_rss(feed_url: str, platform: str) -> List[dict]:
     except Exception as e:
         print(f"Error fetching RSS {feed_url}: {e}")
     
+    print(f"Total videos from feed: {len(videos)}")
     return videos
 
 async def fetch_all_raw_videos() -> List[dict]:
