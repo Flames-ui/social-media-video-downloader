@@ -5,7 +5,7 @@ import json
 import asyncio
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import StreamingResponse
@@ -27,11 +27,10 @@ app.add_middleware(CORSMiddleware,
 )
 
 # ============================================
-# CONFIGURATION
+# CONFIGURATION & PERSISTENCE
 # ============================================
 DATA_DIR = Path("/tmp/reelsdown_data")
 DATA_DIR.mkdir(exist_ok=True)
-
 FETCH_STATE_FILE = DATA_DIR / "fetch_state.json"
 
 def init_json_file(filepath: Path, default_data: dict):
@@ -47,33 +46,31 @@ init_json_file(FETCH_STATE_FILE, {
 })
 
 # ============================================
-# YOUTUBE RSS FEEDS (100% RELIABLE - NEVER BLOCKED)
+# YOUTUBE RSS FEEDS
 # ============================================
 WWE_RSS_FEEDS = [
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCJ5v_MCY6GNUBTO8-D3XoAg",  # WWE
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCFgpoFswJFyJCXzB4L3VQ_w",  # WWE on FOX
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCjC7hBxJC6k9YlNhY6Yy4ZQ",  # WWE NXT
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCaiNqY7UhE4jdpB6zrHkTOg",  # WWE Raw
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCzFdx53syVlYlZZL2zVhROg",  # WWE SmackDown
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCtTMN8Gg7SHM0IrnCJZJgYg",  # WWE WrestleMania
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCz3H0IC_kU5V3B4cV1V1y5g",  # WWE Vault
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCVjYtUoy3Fy7TaZY4iFiG1w",  # WWE Music
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCrD2TNR6cH9nB2g3nGVEp5A",  # Wrestlelamia
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCtC0NgR0wG3m3pH8q5LwZ5w",  # WhatCulture Wrestling
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCAeEAtK6hvmVnZxwMPhHkBg",  # Cultaholic Wrestling
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCJ5v_MCY6GNUBTO8-D3XoAg",
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCFgpoFswJFyJCXzB4L3VQ_w",
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCjC7hBxJC6k9YlNhY6Yy4ZQ",
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCaiNqY7UhE4jdpB6zrHkTOg",
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCzFdx53syVlYlZZL2zVhROg",
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCtTMN8Gg7SHM0IrnCJZJgYg",
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCz3H0IC_kU5V3B4cV1V1y5g",
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCVjYtUoy3Fy7TaZY4iFiG1w",
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCrD2TNR6cH9nB2g3nGVEp5A",
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCtC0NgR0wG3m3pH8q5LwZ5w",
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCAeEAtK6hvmVnZxwMPhHkBg",
 ]
 
 AEW_RSS_FEEDS = [
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCFN4JkGP_bVhAdBsoV9xftA",  # AEW
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCFN4JkGP_bVhAdBsoV9xftA",
 ]
 
 # ============================================
-# HELPER FUNCTIONS
+# UTILITIES
 # ============================================
 def clean_filename(filename: str) -> str:
-    """Remove emojis and special characters from filename"""
-    if not filename:
-        return "video"
+    if not filename: return "video"
     filename = unicodedata.normalize('NFKD', str(filename))
     filename = filename.encode('ASCII', 'ignore').decode('ASCII')
     filename = re.sub(r'[^\w\s-]', '', filename)
@@ -81,26 +78,19 @@ def clean_filename(filename: str) -> str:
     return filename.strip('_')[:50]
 
 def extract_video_id_from_url(url: str) -> Optional[str]:
-    """Extract YouTube video ID from URL"""
-    if 'v=' in url:
-        return url.split('v=')[1].split('&')[0]
-    elif '/shorts/' in url:
-        return url.split('/shorts/')[1].split('?')[0]
-    elif '/embed/' in url:
-        return url.split('/embed/')[1].split('?')[0]
-    elif 'youtu.be/' in url:
-        return url.split('youtu.be/')[1].split('?')[0]
+    if not url: return None
+    if 'v=' in url: return url.split('v=')[1].split('&')[0]
+    elif '/shorts/' in url: return url.split('/shorts/')[1].split('?')[0]
+    elif '/embed/' in url: return url.split('/embed/')[1].split('?')[0]
+    elif 'youtu.be/' in url: return url.split('youtu.be/')[1].split('?')[0]
     return None
 
 def extract_wrestler_from_title(title: str, uploader: str) -> str:
-    """Extract wrestler name from title"""
     known_wrestlers = [
         "Oba Femi", "Roman Reigns", "Cody Rhodes", "Rhea Ripley", "Bianca Belair",
         "Seth Rollins", "LA Knight", "Logan Paul", "Bayley", "Iyo Sky",
-        "Sami Zayn", "Kevin Owens", "Drew McIntyre", "CM Punk", "Darby Allin", "MJF",
-        "Toni Storm", "Will Ospreay", "Kenny Omega", "The Rock", "John Cena",
-        "Brock Lesnar", "Triple H", "Shawn Michaels", "Undertaker", "Stone Cold",
-        "Randy Orton", "AJ Styles", "Finn Balor", "Becky Lynch", "Charlotte Flair"
+        "Sami Zayn", "Kevin Owens", "Drew McIntyre", "CM Punk", "Darby Allin", 
+        "MJF", "Toni Storm", "Will Ospreay", "Kenny Omega", "The Rock", "John Cena"
     ]
     for wrestler in known_wrestlers:
         if wrestler.lower() in title.lower() or wrestler.lower() in uploader.lower():
@@ -108,146 +98,73 @@ def extract_wrestler_from_title(title: str, uploader: str) -> str:
     return uploader
 
 # ============================================
-# YOUTUBE RSS FETCHING (SOLUTION 1: NAMESPACE DICTIONARY)
+# RSS LOGIC (FIXED NAMESPACE HANDLING)
 # ============================================
 async def fetch_single_rss(feed_url: str, platform: str) -> List[dict]:
-    """Fetch raw videos from a single YouTube RSS feed"""
     videos = []
-    
+    namespaces = {
+        'atom': 'http://www.w3.org/2005/Atom',
+        'yt': 'http://www.youtube.com/xml/schemas/2015',
+        'media': 'http://search.yahoo.com/mrss/'
+    }
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(feed_url)
             response.raise_for_status()
-            
-            # Parse XML
-            root = ET.fromstring(response.text)
-            
-            # SOLUTION 1: Define and use namespaces properly
-            namespaces = {
-                'atom': 'http://www.w3.org/2005/Atom',
-                'yt': 'http://www.youtube.com/xml/schemas/2015',
-                'media': 'http://search.yahoo.com/mrss/'
-            }
-            
-            # Use 'atom:entry' with the namespaces dictionary
+            root = ET.fromstring(response.content)
             entries = root.findall('atom:entry', namespaces)
-            print(f"Found {len(entries)} entries in feed")
             
             for entry in entries:
                 try:
-                    # Video ID - using yt namespace
                     video_id_elem = entry.find('yt:videoId', namespaces)
-                    if video_id_elem is None:
-                        continue
-                    video_id = video_id_elem.text
-                    
-                    yt_id = f"yt-{video_id}"
-                    video_url = f"https://www.youtube.com/watch?v={video_id}"
-                    
-                    # Title - using atom namespace
+                    video_id = video_id_elem.text if video_id_elem is not None else None
+                    if not video_id: continue
+
                     title_elem = entry.find('atom:title', namespaces)
                     title = title_elem.text if title_elem is not None else "Wrestling Video"
                     
-                    # Published date - using atom namespace
-                    published_elem = entry.find('atom:published', namespaces)
-                    published = published_elem.text if published_elem is not None else datetime.now().isoformat()
-                    
-                    # Author/Channel - using atom namespace
-                    author_elem = entry.find('atom:author/atom:name', namespaces)
-                    uploader = author_elem.text if author_elem is not None else "WWE"
-                    
-                    # Description - using media namespace
-                    desc_elem = entry.find('media:group/media:description', namespaces)
-                    if desc_elem is None:
-                        desc_elem = entry.find('.//media:description', namespaces)
-                    original_description = desc_elem.text if desc_elem is not None else ""
-                    
-                    # Thumbnail - using media namespace
-                    thumb_elem = entry.find('media:group/media:thumbnail', namespaces)
-                    if thumb_elem is None:
-                        thumb_elem = entry.find('.//media:thumbnail', namespaces)
-                    thumbnail = thumb_elem.get('url', '') if thumb_elem is not None else ""
-                    
-                    # Duration - using yt namespace (in seconds)
-                    duration_elem = entry.find('media:group/yt:duration', namespaces)
-                    if duration_elem is None:
-                        duration_elem = entry.find('.//yt:duration', namespaces)
-                    duration = int(duration_elem.text) if duration_elem is not None and duration_elem.text else 0
-                    
-                    # View count - using media namespace
-                    stats_elem = entry.find('media:group/media:community/media:statistics', namespaces)
-                    if stats_elem is None:
-                        stats_elem = entry.find('.//media:statistics', namespaces)
-                    view_count = int(stats_elem.get('views', 0)) if stats_elem is not None else 0
-                    
-                    wrestler = extract_wrestler_from_title(title, uploader)
-                    
-                    video_data = {
-                        "id": yt_id,
+                    media_group = entry.find('media:group', namespaces)
+                    thumbnail = ""
+                    description = ""
+                    view_count = 0
+                    duration = 0
+
+                    if media_group is not None:
+                        thumb_elem = media_group.find('media:thumbnail', namespaces)
+                        thumbnail = thumb_elem.get('url', '') if thumb_elem is not None else ""
+                        desc_elem = media_group.find('media:description', namespaces)
+                        description = desc_elem.text[:500] if desc_elem is not None and desc_elem.text else ""
+                        stats_elem = media_group.find('media:community/media:statistics', namespaces)
+                        if stats_elem is not None: view_count = int(stats_elem.get('views', 0))
+                        dur_elem = media_group.find('yt:duration', namespaces)
+                        if dur_elem is not None: duration = int(dur_elem.text)
+
+                    author_name = entry.find('.//atom:author/atom:name', namespaces)
+                    uploader = author_name.text if author_name is not None else platform.upper()
+                    pub_elem = entry.find('atom:published', namespaces)
+                    published = pub_elem.text if pub_elem is not None else datetime.now().isoformat()
+
+                    videos.append({
+                        "id": f"yt-{video_id}",
                         "platform": "youtube",
                         "original_id": video_id,
                         "original_title": title,
-                        "original_description": original_description,
+                        "original_description": description,
                         "thumbnail": thumbnail,
-                        "video_url": video_url,
+                        "video_url": f"https://www.youtube.com/watch?v={video_id}",
                         "uploader": uploader,
-                        "wrestler": wrestler,
+                        "wrestler": extract_wrestler_from_title(title, uploader),
                         "duration": duration,
                         "view_count": view_count,
-                        "like_count": 0,
                         "upload_timestamp": published,
-                        "tags": [platform, "youtube"],
                         "platform_category": platform
-                    }
-                    
-                    videos.append(video_data)
-                    print(f"✅ Parsed: {title[:50]}")
-                    
-                except Exception as e:
-                    print(f"Error parsing entry: {e}")
-                    continue
-                    
-    except Exception as e:
-        print(f"Error fetching RSS {feed_url}: {e}")
-    
-    print(f"Total videos from feed: {len(videos)}")
+                    })
+                except Exception: continue
+    except Exception as e: print(f"Error: {e}")
     return videos
 
-async def fetch_all_raw_videos() -> List[dict]:
-    """Fetch ALL raw videos from all RSS feeds"""
-    all_videos = []
-    
-    # Fetch WWE videos
-    for feed_url in WWE_RSS_FEEDS:
-        videos = await fetch_single_rss(feed_url, "wwe")
-        all_videos.extend(videos)
-    
-    # Fetch AEW videos
-    for feed_url in AEW_RSS_FEEDS:
-        videos = await fetch_single_rss(feed_url, "aew")
-        all_videos.extend(videos)
-    
-    # Update fetch state
-    with open(FETCH_STATE_FILE, 'r') as f:
-        state = json.load(f)
-    
-    wwe_count = sum(1 for v in all_videos if v["platform_category"] == "wwe")
-    aew_count = sum(1 for v in all_videos if v["platform_category"] == "aew")
-    
-    state.update({
-        "last_fetch": datetime.now().isoformat(),
-        "total_fetched": len(all_videos),
-        "wwe_count": wwe_count,
-        "aew_count": aew_count
-    })
-    
-    with open(FETCH_STATE_FILE, 'w') as f:
-        json.dump(state, f, indent=2)
-    
-    return all_videos
-
 # ============================================
-# DOWNLOADER LOGIC (FULLY FUNCTIONAL)
+# DOWNLOADER CORE LOGIC
 # ============================================
 YDL_OPTS_BASE = {
     'quiet': True,
@@ -267,20 +184,16 @@ YDL_OPTS_BASE = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-us,en;q=0.5',
-        'Accept-Encoding': 'gzip,deflate',
         'Connection': 'keep-alive',
     }
 }
 
 @app.get("/info")
 async def get_video_info(url: str = Query(...)):
-    """Get video metadata - works for YouTube, Facebook, Instagram, X"""
     try:
-        ydl_opts = YDL_OPTS_BASE.copy()
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(YDL_OPTS_BASE) as ydl:
             info = ydl.extract_info(url, download=False)
-            if not info:
-                raise Exception("No info returned")
+            if not info: raise Exception("No info found")
             return {
                 "title": info.get("title", "Unknown"),
                 "thumbnail": info.get("thumbnail", ""),
@@ -292,151 +205,69 @@ async def get_video_info(url: str = Query(...)):
                 "platform": info.get("extractor_key", "unknown"),
             }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error fetching info: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error: {str(e)}")
 
 @app.get("/download")
 async def download_video(url: str = Query(...), format: str = Query("best")):
-    """Download video - works for YouTube, Facebook, Instagram, X"""
     try:
-        ydl_opts = YDL_OPTS_BASE.copy()
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(YDL_OPTS_BASE) as ydl:
             info = ydl.extract_info(url, download=False)
-            original_title = info.get("title", "video")
-            clean_title = clean_filename(original_title)
+            clean_title = clean_filename(info.get("title", "video"))
             filename = f"{clean_title}.mp4"
 
         uid = uuid.uuid4().hex[:8]
         output_template = f"/tmp/{uid}.%(ext)s"
 
-        if format == "best":
-            format_string = "best[ext=mp4]/best"
-        elif format == "hd":
-            format_string = "best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best"
-        elif format == "sd":
-            format_string = "best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/best"
-        elif format == "audio":
-            format_string = "bestaudio/best"
-        else:
-            format_string = format
+        format_string = {
+            "best": "best[ext=mp4]/best",
+            "hd": "best[height<=720][ext=mp4]/best",
+            "sd": "best[height<=480][ext=mp4]/best",
+            "audio": "bestaudio/best"
+        }.get(format, format)
 
-        ydl_opts.update({
-            'format': format_string,
-            'outtmpl': output_template,
-            'merge_output_format': 'mp4',
-        })
+        opts = {**YDL_OPTS_BASE, 'format': format_string, 'outtmpl': output_template, 'merge_output_format': 'mp4'}
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
 
-        actual_file_path = None
-        for f in os.listdir("/tmp"):
-            if f.startswith(uid):
-                actual_file_path = os.path.join("/tmp", f)
-                break
-
-        if not actual_file_path or not os.path.exists(actual_file_path):
-            raise HTTPException(status_code=500, detail="Download failed")
+        file_path = next((os.path.join("/tmp", f) for f in os.listdir("/tmp") if f.startswith(uid)), None)
+        if not file_path: raise HTTPException(status_code=500, detail="Download failed")
 
         def iterfile():
-            with open(actual_file_path, "rb") as f:
-                yield from f
-            try:
-                os.unlink(actual_file_path)
-            except:
-                pass
+            with open(file_path, "rb") as f: yield from f
+            try: os.unlink(file_path)
+            except: pass
 
-        return StreamingResponse(
-            iterfile(),
-            media_type="video/mp4",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-        )
-
+        return StreamingResponse(iterfile(), media_type="video/mp4",
+                                 headers={"Content-Disposition": f'attachment; filename="{filename}"'})
     except Exception as e:
-        error_msg = str(e)
-        if "Sign in to confirm" in error_msg:
-            raise HTTPException(status_code=403, detail="Platform is blocking this request")
-        elif "Video unavailable" in error_msg:
-            raise HTTPException(status_code=404, detail="Video unavailable or private")
-        else:
-            raise HTTPException(status_code=500, detail=f"Error: {error_msg}")
-
-# ============================================
-# API ENDPOINTS FOR LOVABLE
-# ============================================
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/fetch/raw")
 async def fetch_raw_videos():
-    """
-    Fetch ALL raw videos from YouTube RSS feeds.
-    Returns raw data - Lovable will AI rewrite and save to Supabase.
-    Videos contain 'video_url' ready for immediate playback.
-    """
-    print(f"[{datetime.now()}] Fetching all raw videos from RSS...")
-    videos = await fetch_all_raw_videos()
-    print(f"[{datetime.now()}] Fetched {len(videos)} total videos")
+    all_videos = []
+    for f in WWE_RSS_FEEDS: all_videos.extend(await fetch_single_rss(f, "wwe"))
+    for f in AEW_RSS_FEEDS: all_videos.extend(await fetch_single_rss(f, "aew"))
     
-    return {
-        "success": True,
-        "videos": videos,
-        "total": len(videos),
-        "wwe_count": sum(1 for v in videos if v["platform_category"] == "wwe"),
-        "aew_count": sum(1 for v in videos if v["platform_category"] == "aew"),
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.get("/fetch/status")
-async def get_fetch_status():
-    """Get current fetch status"""
-    try:
-        with open(FETCH_STATE_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        return {"last_fetch": None, "total_fetched": 0}
+    with open(FETCH_STATE_FILE, 'r') as f: state = json.load(f)
+    state.update({"last_fetch": datetime.now().isoformat(), "total_fetched": len(all_videos)})
+    with open(FETCH_STATE_FILE, 'w') as f: json.dump(state, f)
+    
+    return {"success": True, "videos": all_videos, "total": len(all_videos)}
 
 @app.get("/preview")
 async def get_preview_url(url: str = Query(...)):
-    """Get direct video URL for player embed"""
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-            'format': 'best[ext=mp4]/best',
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        opts = {**YDL_OPTS_BASE, 'format': 'best[ext=mp4]/best'}
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            return {
-                "video_url": info.get('url', ''),
-                "thumbnail": info.get('thumbnail', ''),
-                "title": info.get('title', ''),
-                "uploader": info.get('uploader', ''),
-                "duration": info.get('duration', 0)
-            }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+            return {"video_url": info.get('url', ''), "thumbnail": info.get('thumbnail', ''), "title": info.get('title', '')}
+    except Exception as e: raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/")
 async def root():
-    return {
-        "message": "Welcome to ReelsDown Video Downloader API",
-        "status": "operational",
-        "architecture": "Render fetches raw RSS only. Lovable handles AI rewriting and Supabase storage.",
-        "endpoints": {
-            "/fetch/raw": "GET all raw videos from YouTube RSS (Lovable calls this)",
-            "/fetch/status": "GET fetch status",
-            "/info": "GET video metadata",
-            "/download": "GET download video file",
-            "/preview": "GET video preview URL"
-        },
-        "formats": ["best", "hd", "sd", "audio"],
-        "supported_platforms": ["YouTube", "Facebook", "Instagram", "Twitter/X"],
-        "rss_feeds": {
-            "wwe": len(WWE_RSS_FEEDS),
-            "aew": len(AEW_RSS_FEEDS)
-        }
-    }
+    return {"message": "ReelsDown API Operational", "endpoints": ["/info", "/download", "/fetch/raw", "/preview"]}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
