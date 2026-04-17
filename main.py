@@ -98,50 +98,45 @@ def extract_wrestler_from_title(title: str, uploader: str) -> str:
     return uploader
 
 # ============================================
-# RSS LOGIC (FIXED NAMESPACE HANDLING)
+# WILDCARD RSS LOGIC (FIXES 0 RESULTS ISSUE)
 # ============================================
 async def fetch_single_rss(feed_url: str, platform: str) -> List[dict]:
     videos = []
-    namespaces = {
-        'atom': 'http://www.w3.org/2005/Atom',
-        'yt': 'http://www.youtube.com/xml/schemas/2015',
-        'media': 'http://search.yahoo.com/mrss/'
-    }
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(feed_url)
             response.raise_for_status()
+            
             root = ET.fromstring(response.content)
-            entries = root.findall('atom:entry', namespaces)
+            # Use Wildcard {*} to ignore namespace URI mismatches
+            entries = root.findall('.//{*}entry')
             
             for entry in entries:
                 try:
-                    video_id_elem = entry.find('yt:videoId', namespaces)
-                    video_id = video_id_elem.text if video_id_elem is not None else None
-                    if not video_id: continue
+                    # Find IDs and Metadata using wildcard
+                    id_elem = entry.find('.//{*}videoId')
+                    if id_elem is None: continue
+                    video_id = id_elem.text
 
-                    title_elem = entry.find('atom:title', namespaces)
+                    title_elem = entry.find('.//{*}title')
                     title = title_elem.text if title_elem is not None else "Wrestling Video"
                     
-                    media_group = entry.find('media:group', namespaces)
-                    thumbnail = ""
-                    description = ""
-                    view_count = 0
-                    duration = 0
+                    thumb_elem = entry.find('.//{*}thumbnail')
+                    thumbnail = thumb_elem.get('url') if thumb_elem is not None else ""
+                    
+                    desc_elem = entry.find('.//{*}description')
+                    description = desc_elem.text[:500] if desc_elem is not None and desc_elem.text else ""
+                    
+                    stats_elem = entry.find('.//{*}statistics')
+                    view_count = int(stats_elem.get('views', 0)) if stats_elem is not None else 0
 
-                    if media_group is not None:
-                        thumb_elem = media_group.find('media:thumbnail', namespaces)
-                        thumbnail = thumb_elem.get('url', '') if thumb_elem is not None else ""
-                        desc_elem = media_group.find('media:description', namespaces)
-                        description = desc_elem.text[:500] if desc_elem is not None and desc_elem.text else ""
-                        stats_elem = media_group.find('media:community/media:statistics', namespaces)
-                        if stats_elem is not None: view_count = int(stats_elem.get('views', 0))
-                        dur_elem = media_group.find('yt:duration', namespaces)
-                        if dur_elem is not None: duration = int(dur_elem.text)
+                    dur_elem = entry.find('.//{*}duration')
+                    duration = int(dur_elem.text) if dur_elem is not None and dur_elem.text else 0
 
-                    author_name = entry.find('.//atom:author/atom:name', namespaces)
-                    uploader = author_name.text if author_name is not None else platform.upper()
-                    pub_elem = entry.find('atom:published', namespaces)
+                    author_elem = entry.find('.//{*}author/{*}name')
+                    uploader = author_elem.text if author_elem is not None else platform.upper()
+
+                    pub_elem = entry.find('.//{*}published')
                     published = pub_elem.text if pub_elem is not None else datetime.now().isoformat()
 
                     videos.append({
@@ -160,11 +155,12 @@ async def fetch_single_rss(feed_url: str, platform: str) -> List[dict]:
                         "platform_category": platform
                     })
                 except Exception: continue
-    except Exception as e: print(f"Error: {e}")
+    except Exception as e:
+        print(f"Error fetching {feed_url}: {e}")
     return videos
 
 # ============================================
-# DOWNLOADER CORE LOGIC
+# DOWNLOADER LOGIC (RETAINED & POWERFUL)
 # ============================================
 YDL_OPTS_BASE = {
     'quiet': True,
@@ -246,9 +242,15 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
 @app.get("/fetch/raw")
 async def fetch_raw_videos():
     all_videos = []
-    for f in WWE_RSS_FEEDS: all_videos.extend(await fetch_single_rss(f, "wwe"))
-    for f in AEW_RSS_FEEDS: all_videos.extend(await fetch_single_rss(f, "aew"))
+    # Fetch all feeds
+    tasks = [fetch_single_rss(f, "wwe") for f in WWE_RSS_FEEDS] + \
+            [fetch_single_rss(f, "aew") for f in AEW_RSS_FEEDS]
     
+    results = await asyncio.gather(*tasks)
+    for res in results:
+        all_videos.extend(res)
+    
+    # Update state
     with open(FETCH_STATE_FILE, 'r') as f: state = json.load(f)
     state.update({"last_fetch": datetime.now().isoformat(), "total_fetched": len(all_videos)})
     with open(FETCH_STATE_FILE, 'w') as f: json.dump(state, f)
@@ -266,7 +268,7 @@ async def get_preview_url(url: str = Query(...)):
 
 @app.get("/")
 async def root():
-    return {"message": "ReelsDown API Operational", "endpoints": ["/info", "/download", "/fetch/raw", "/preview"]}
+    return {"message": "ReelsDown API Operational", "status": "active"}
 
 if __name__ == "__main__":
     import uvicorn
