@@ -7,7 +7,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request, Header
 from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
@@ -57,6 +57,9 @@ AEW_RSS_FEEDS = [
 CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 MOBILE_UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
 
+# Averi AI Configuration
+AVERI_API_KEY = os.getenv("AVERI_API_KEY", "averi-secret-key-2026")
+
 def clean_filename(filename):
     if not filename: return "video"
     filename = unicodedata.normalize('NFKD', str(filename))
@@ -91,6 +94,90 @@ def extract_wrestler_from_title(title, uploader):
     return uploader
 
 # ============================================
+# AVERI AI WEBHOOK ENDPOINT (NEW)
+# ============================================
+@app.post("/api/averi-content")
+async def receive_averi_content(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key")
+):
+    """
+    Receives content from Averi AI and saves to local JSON storage.
+    Averi AI should send a POST request with JSON content.
+    """
+    # Authenticate
+    if x_api_key != AVERI_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    try:
+        content = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    
+    # Validate required fields
+    required_fields = ["title", "content"]
+    for field in required_fields:
+        if field not in content:
+            raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+    
+    # Add metadata
+    content["id"] = f"averi-{uuid.uuid4().hex[:12]}"
+    content["received_at"] = datetime.now().isoformat()
+    content["source"] = "averi_ai"
+    
+    # Save to JSON file
+    averi_file = DATA_DIR / "averi_content.json"
+    
+    try:
+        if averi_file.exists():
+            with open(averi_file, 'r') as f:
+                existing = json.load(f)
+        else:
+            existing = {"articles": []}
+        
+        existing["articles"].insert(0, content)
+        existing["articles"] = existing["articles"][:500]  # Keep last 500
+        existing["total"] = len(existing["articles"])
+        existing["last_received"] = datetime.now().isoformat()
+        
+        with open(averi_file, 'w') as f:
+            json.dump(existing, f, indent=2)
+        
+        print(f"[{datetime.now()}] Averi AI content saved: {content['title'][:50]}")
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save content: {str(e)}")
+    
+    return {
+        "success": True,
+        "id": content["id"],
+        "message": "Content received and saved successfully",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/api/averi-content")
+async def get_averi_content(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    limit: int = Query(20, ge=1, le=100)
+):
+    """Retrieve Averi AI generated content"""
+    if x_api_key != AVERI_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    averi_file = DATA_DIR / "averi_content.json"
+    if not averi_file.exists():
+        return {"articles": [], "total": 0}
+    
+    with open(averi_file, 'r') as f:
+        data = json.load(f)
+    
+    return {
+        "articles": data["articles"][:limit],
+        "total": data.get("total", 0),
+        "last_received": data.get("last_received")
+    }
+
+# ============================================
 # PLATFORM-SPECIFIC SCRAPERS (No API key needed)
 # ============================================
 
@@ -107,7 +194,6 @@ async def get_tiktok_url(url: str) -> Optional[str]:
                 data = r.json()
                 if data.get("code") == 0:
                     video_data = data.get("data", {})
-                    # Return HD no-watermark URL
                     return video_data.get("hdplay") or video_data.get("play") or video_data.get("wmplay")
     except Exception as e:
         print(f"TikTok API error: {e}")
@@ -116,24 +202,18 @@ async def get_tiktok_url(url: str) -> Optional[str]:
 async def get_instagram_url(url: str) -> Optional[str]:
     """Get Instagram video URL using instaloader approach"""
     try:
-        # Use Instagram's own oEmbed API for metadata
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.get(
                 f"https://api.instagram.com/oembed/?url={url}",
                 headers={"User-Agent": MOBILE_UA}
             )
             if r.status_code == 200:
-                data = r.json()
-                # oEmbed gives thumbnail but not video URL
-                # Use alternative scraper
                 pass
     except Exception:
         pass
 
-    # Try saveinsta approach
     try:
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            # Get shortcode from URL
             match = re.search(r'/(p|reel|tv)/([A-Za-z0-9_-]+)', url)
             if not match: return None
             shortcode = match.group(2)
@@ -159,13 +239,11 @@ async def get_instagram_url(url: str) -> Optional[str]:
 async def get_twitter_url(url: str) -> Optional[str]:
     """Get Twitter/X video URL using fxtwitter API"""
     try:
-        # Extract tweet ID
         match = re.search(r'status/(\d+)', url)
         if not match: return None
         tweet_id = match.group(1)
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Use fxtwitter/FixTweet API (free, no key)
             r = await client.get(
                 f"https://api.fxtwitter.com/status/{tweet_id}",
                 headers={"User-Agent": CHROME_UA}
@@ -176,10 +254,8 @@ async def get_twitter_url(url: str) -> Optional[str]:
                 media = tweet.get("media", {})
                 videos = media.get("videos", [])
                 if videos:
-                    # Get highest quality
                     best = max(videos, key=lambda v: v.get("width", 0) * v.get("height", 0))
                     return best.get("url")
-                # Check for external media
                 external = media.get("external", {})
                 if external.get("url"):
                     return external["url"]
@@ -189,7 +265,7 @@ async def get_twitter_url(url: str) -> Optional[str]:
 
 async def get_facebook_url(url: str) -> Optional[str]:
     """Get Facebook video URL - yt-dlp works well for FB"""
-    return None  # Fall through to yt-dlp which handles FB well
+    return None
 
 async def get_soundcloud_url(url: str) -> Optional[str]:
     """SoundCloud works with yt-dlp"""
@@ -213,14 +289,12 @@ def get_ytdlp_opts(platform: str, fmt: str, output: str, is_audio: bool = False)
     }
 
     if platform == 'youtube':
-        # mweb client avoids PO token requirement for most videos
         opts['extractor_args'] = {
             'youtube': {
                 'player_client': ['mweb', 'android_vr', 'android'],
                 'skip': ['hls'],
             }
         }
-        # Use combined formats to avoid DASH issues
         if not is_audio:
             opts['format'] = 'best[ext=mp4]/best'
 
@@ -246,7 +320,6 @@ def get_ytdlp_opts(platform: str, fmt: str, output: str, is_audio: bool = False)
 
 def build_format(fmt: str, platform: str) -> str:
     if platform == 'youtube':
-        # Use combined format for YouTube to avoid PO token issues with DASH
         return 'best[ext=mp4]/best'
     if fmt in ['mp3', 'audio']: return 'bestaudio/best'
     return {
@@ -308,7 +381,20 @@ async def fetch_single_rss(feed_url, platform):
 
 @app.get("/")
 async def root():
-    return {"message": "ReelsDown API Operational", "status": "active", "version": "3.1"}
+    return {
+        "message": "ReelsDown API Operational", 
+        "status": "active", 
+        "version": "3.2",
+        "endpoints": {
+            "/info": "GET video metadata",
+            "/download": "GET download video file",
+            "/preview": "GET video preview URL",
+            "/fetch/raw": "GET all raw videos from RSS",
+            "/fetch/new": "GET new videos since timestamp",
+            "/status": "GET API status",
+            "/api/averi-content": "POST (webhook) & GET - Averi AI integration"
+        }
+    }
 
 @app.get("/info")
 async def get_video_info(url: str = Query(...)):
@@ -362,7 +448,6 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
         platform = detect_platform(url)
         is_audio = format in ['mp3', 'audio'] or platform in ['spotify', 'audiomack', 'soundcloud', 'applemusic']
 
-        # ── STRATEGY 1: Platform-specific scrapers ──────────────
         direct_url = None
 
         if platform == 'tiktok':
@@ -373,7 +458,6 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
             direct_url = await get_instagram_url(url)
 
         if direct_url:
-            # Stream directly from platform CDN
             async def stream_direct():
                 async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
                     async with client.stream("GET", direct_url, headers={"User-Agent": MOBILE_UA}) as response:
@@ -388,7 +472,6 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
                 headers={"Content-Disposition": f'attachment; filename="video.{ext}"'}
             )
 
-        # ── STRATEGY 2: yt-dlp ─────────────────────────────────
         uid = uuid.uuid4().hex[:8]
         ext = 'mp3' if is_audio else 'mp4'
         output_template = f"/tmp/{uid}.%(ext)s"
@@ -431,7 +514,6 @@ async def get_preview_url(url: str = Query(...)):
     try:
         platform = detect_platform(url)
 
-        # Platform-specific scrapers for preview
         if platform == 'tiktok':
             v = await get_tiktok_url(url)
             if v: return {"video_url": v, "thumbnail": "", "title": "", "platform": platform}
@@ -440,7 +522,6 @@ async def get_preview_url(url: str = Query(...)):
             v = await get_twitter_url(url)
             if v: return {"video_url": v, "thumbnail": "", "title": "", "platform": platform}
 
-        # yt-dlp fallback
         fmt = build_format('best', platform)
         opts = get_ytdlp_opts(platform, fmt, '/tmp/preview')
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -486,7 +567,7 @@ async def get_status():
     try:
         with open(FETCH_STATE_FILE, 'r') as f: state = json.load(f)
     except: state = {}
-    return {"status": "operational", "version": "3.1", "fetch_state": state}
+    return {"status": "operational", "version": "3.2", "fetch_state": state}
 
 if __name__ == "__main__":
     import uvicorn
