@@ -14,6 +14,10 @@ import yt_dlp
 import httpx
 from dotenv import load_dotenv
 from pingtop_handler import get_pingtop_video
+from whatsapp_processor import (
+    create_job, update_job, get_job, cleanup_old_jobs,
+    process_video_pipeline, PROCESS_DIR, jobs
+)
 from typing import Optional, List
 
 app = FastAPI()
@@ -517,6 +521,191 @@ async def get_status():
         with open(FETCH_STATE_FILE, 'r') as f: state = json.load(f)
     except: state = {}
     return {"status": "operational", "version": "3.1", "fetch_state": state}
+
+# ============================================
+# WHATSAPP VIDEO PROCESSING ENDPOINTS
+# ============================================
+
+@app.post("/process-video")
+async def process_video(request: dict):
+    """
+    Main WhatsApp processing endpoint.
+    Accepts: { "url": "https://facebook.com/..." }
+    Returns: job_id to poll for status
+    """
+    # Clean up old jobs periodically
+    cleanup_old_jobs()
+
+    url = request.get("url", "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing 'url' field in request body")
+
+    platform = detect_platform(url)
+
+    # Create job
+    job = create_job("whatsapp_process", source_url=url)
+    job_id = job["job_id"]
+
+    # Download video first
+    uid = uuid.uuid4().hex[:8]
+    output_template = f"/tmp/{uid}.%(ext)s"
+
+    try:
+        # Download using yt-dlp (supports Facebook, YouTube, TikTok etc)
+        ydl_opts = get_ydl_opts(platform, "best[ext=mp4]/best", output_template)
+        ydl_opts["outtmpl"] = output_template
+
+        def download_sync():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+        # Run download in thread pool to not block event loop
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, download_sync)
+
+        # Find downloaded file
+        input_path = next(
+            (os.path.join("/tmp", f) for f in os.listdir("/tmp") if f.startswith(uid)),
+            None
+        )
+
+        if not input_path:
+            update_job(job_id, status="failed", error="Download failed — could not fetch video")
+            return {
+                "job_id": job_id,
+                "status": "failed",
+                "error": "Could not download video from provided URL",
+            }
+
+        # Start processing pipeline in background (non-blocking)
+        asyncio.create_task(process_video_pipeline(job_id, url, input_path))
+
+        return {
+            "job_id": job_id,
+            "status": "processing",
+            "message": "Video downloaded. Processing for WhatsApp...",
+            "poll_url": f"/status/{job_id}",
+        }
+
+    except Exception as e:
+        update_job(job_id, status="failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+
+@app.get("/status/{job_id}")
+async def get_job_status(job_id: str):
+    """
+    Poll job processing status.
+    Returns: status, progress %, and output URLs when done
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found. It may have expired (jobs are deleted after 1 hour).")
+
+    response = {
+        "job_id": job_id,
+        "status": job["status"],        # queued / processing / done / failed
+        "progress": job["progress"],    # 0-100
+        "created_at": job["created_at"],
+        "error": job.get("error"),
+    }
+
+    if job["status"] == "done":
+        outputs = job.get("outputs", {})
+        response["outputs"] = {
+            "original": {
+                "url": outputs.get("original", {}).get("url"),
+                "label": outputs.get("original", {}).get("label"),
+                "size_mb": outputs.get("original", {}).get("size_mb"),
+            } if outputs.get("original") else None,
+            "whatsapp": {
+                "url": outputs.get("whatsapp", {}).get("url"),
+                "label": outputs.get("whatsapp", {}).get("label"),
+                "size_mb": outputs.get("whatsapp", {}).get("size_mb"),
+                "whatsapp_compatible": outputs.get("whatsapp", {}).get("whatsapp_compatible"),
+            } if outputs.get("whatsapp") else None,
+            "clips": [
+                {"url": c["url"], "label": c["label"], "size_mb": c["size_mb"]}
+                for c in outputs.get("clips", [])
+            ],
+            "audio": {
+                "url": outputs.get("audio", {}).get("url"),
+                "label": outputs.get("audio", {}).get("label"),
+                "size_mb": outputs.get("audio", {}).get("size_mb"),
+            } if outputs.get("audio") else None,
+        }
+        response["video_info"] = job.get("video_info", {})
+
+    return response
+
+
+@app.get("/download-processed/{job_id}/{output_type}")
+async def download_processed(job_id: str, output_type: str, clip: int = 1):
+    """
+    Stream processed output file to client.
+    output_type: original | whatsapp | audio | clip
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+
+    outputs = job.get("outputs", {})
+
+    if output_type == "clip":
+        clips = outputs.get("clips", [])
+        idx = clip - 1
+        if idx < 0 or idx >= len(clips):
+            raise HTTPException(status_code=404, detail=f"Clip {clip} not found")
+        file_path = clips[idx]["path"]
+        filename = f"whatsapp_status_clip_{clip}.mp4"
+        media_type = "video/mp4"
+
+    elif output_type in ["original", "whatsapp", "raw"]:
+        output = outputs.get("original" if output_type in ["original", "raw"] else "whatsapp", {})
+        file_path = output.get("path", "")
+        filename = f"reelsdown_{output_type}.mp4"
+        media_type = "video/mp4"
+
+    elif output_type == "audio":
+        output = outputs.get("audio", {})
+        file_path = output.get("path", "")
+        filename = "reelsdown_audio.mp3"
+        media_type = "audio/mpeg"
+
+    else:
+        raise HTTPException(status_code=400, detail="Invalid output type")
+
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found or already deleted")
+
+    def iterfile():
+        with open(file_path, "rb") as f:
+            yield from f
+
+    return StreamingResponse(
+        iterfile(),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@app.get("/jobs")
+async def list_active_jobs():
+    """List all active jobs (for monitoring)"""
+    cleanup_old_jobs()
+    return {
+        "total": len(jobs),
+        "jobs": [
+            {
+                "job_id": jid,
+                "status": j["status"],
+                "progress": j["progress"],
+                "created_at": j["created_at"],
+            }
+            for jid, j in jobs.items()
+        ]
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
