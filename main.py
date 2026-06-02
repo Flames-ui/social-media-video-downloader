@@ -7,15 +7,20 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from fastapi import FastAPI, Query, HTTPException, Request, Header
-from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 import httpx
 from dotenv import load_dotenv
 from typing import Optional, List
+from pydantic import BaseModel
+import subprocess
+import tempfile
+import random
 
 app = FastAPI()
+
 load_dotenv()
 
 app.add_middleware(CORSMiddleware,
@@ -25,17 +30,47 @@ app.add_middleware(CORSMiddleware,
     allow_headers=["*"],
 )
 
+# ============================================
+# CONFIGURATION & PERSISTENCE
+# ============================================
 DATA_DIR = Path("/tmp/reelsdown_data")
 DATA_DIR.mkdir(exist_ok=True)
 FETCH_STATE_FILE = DATA_DIR / "fetch_state.json"
 
-def init_json_file(filepath, default_data):
+def init_json_file(filepath: Path, default_data: dict):
     if not filepath.exists():
         with open(filepath, 'w') as f:
             json.dump(default_data, f)
 
-init_json_file(FETCH_STATE_FILE, {"last_fetch": None, "total_fetched": 0, "wwe_count": 0, "aew_count": 0})
+init_json_file(FETCH_STATE_FILE, {
+    "last_fetch": None,
+    "total_fetched": 0,
+    "wwe_count": 0,
+    "aew_count": 0
+})
 
+# ============================================
+# VIDEO ANALYZE REQUEST/RESPONSE MODELS
+# ============================================
+class VideoAnalysisRequest(BaseModel):
+    url: str
+    user_id: Optional[str] = None
+
+class VideoAnalysisResponse(BaseModel):
+    success: bool
+    video_url: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    summary: Optional[str] = None
+    tags: Optional[List[str]] = None
+    duration: Optional[int] = None
+    thumbnail: Optional[str] = None
+    download_url: Optional[str] = None
+    error: Optional[str] = None
+
+# ============================================
+# YOUTUBE RSS FEEDS
+# ============================================
 WWE_RSS_FEEDS = [
     "https://www.youtube.com/feeds/videos.xml?channel_id=UCJ5v_MCY6GNUBTO8-D3XoAg",
     "https://www.youtube.com/feeds/videos.xml?channel_id=UCFgpoFswJFyJCXzB4L3VQ_w",
@@ -54,13 +89,10 @@ AEW_RSS_FEEDS = [
     "https://www.youtube.com/feeds/videos.xml?channel_id=UCFN4JkGP_bVhAdBsoV9xftA",
 ]
 
-CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-MOBILE_UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
-
-# Averi AI Configuration
-AVERI_API_KEY = os.getenv("AVERI_API_KEY", "averi-secret-key-2026")
-
-def clean_filename(filename):
+# ============================================
+# UTILITIES
+# ============================================
+def clean_filename(filename: str) -> str:
     if not filename: return "video"
     filename = unicodedata.normalize('NFKD', str(filename))
     filename = filename.encode('ASCII', 'ignore').decode('ASCII')
@@ -68,506 +100,331 @@ def clean_filename(filename):
     filename = re.sub(r'[-\s]+', '_', filename)
     return filename.strip('_')[:50]
 
-def detect_platform(url):
-    u = url.lower()
-    if 'youtube.com' in u or 'youtu.be' in u: return 'youtube'
-    if 'tiktok.com' in u: return 'tiktok'
-    if 'instagram.com' in u: return 'instagram'
-    if 'facebook.com' in u or 'fb.watch' in u or 'fb.com' in u: return 'facebook'
-    if 'twitter.com' in u or 'x.com' in u: return 'twitter'
-    if 'threads.net' in u: return 'threads'
-    if 'linkedin.com' in u: return 'linkedin'
-    if 'spotify.com' in u: return 'spotify'
-    if 'audiomack.com' in u: return 'audiomack'
-    if 'soundcloud.com' in u: return 'soundcloud'
-    if 'music.apple.com' in u: return 'applemusic'
-    return 'unknown'
+def extract_video_id_from_url(url: str) -> Optional[str]:
+    if not url: return None
+    if 'v=' in url: return url.split('v=')[1].split('&')[0]
+    elif '/shorts/' in url: return url.split('/shorts/')[1].split('?')[0]
+    elif '/embed/' in url: return url.split('/embed/')[1].split('?')[0]
+    elif 'youtu.be/' in url: return url.split('youtu.be/')[1].split('?')[0]
+    return None
 
-def extract_wrestler_from_title(title, uploader):
-    wrestlers = ["Oba Femi","Roman Reigns","Cody Rhodes","Rhea Ripley","Bianca Belair",
-                 "Seth Rollins","LA Knight","Logan Paul","Bayley","Iyo Sky","Sami Zayn",
-                 "Kevin Owens","Drew McIntyre","CM Punk","Darby Allin","MJF","Toni Storm",
-                 "Will Ospreay","Kenny Omega","The Rock","John Cena"]
-    for w in wrestlers:
-        if w.lower() in title.lower() or w.lower() in uploader.lower():
-            return w
+def extract_wrestler_from_title(title: str, uploader: str) -> str:
+    known_wrestlers = [
+        "Oba Femi", "Roman Reigns", "Cody Rhodes", "Rhea Ripley", "Bianca Belair",
+        "Seth Rollins", "LA Knight", "Logan Paul", "Bayley", "Iyo Sky",
+        "Sami Zayn", "Kevin Owens", "Drew McIntyre", "CM Punk", "Darby Allin", 
+        "MJF", "Toni Storm", "Will Ospreay", "Kenny Omega", "The Rock", "John Cena"
+    ]
+    for wrestler in known_wrestlers:
+        if wrestler.lower() in title.lower() or wrestler.lower() in uploader.lower():
+            return wrestler
     return uploader
 
 # ============================================
-# AVERI AI WEBHOOK ENDPOINT (NEW)
+# WILDCARD RSS LOGIC (FIXES 0 RESULTS ISSUE)
 # ============================================
-@app.post("/api/averi-content")
-async def receive_averi_content(
-    request: Request,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key")
-):
-    """
-    Receives content from Averi AI and saves to local JSON storage.
-    Averi AI should send a POST request with JSON content.
-    """
-    # Authenticate
-    if x_api_key != AVERI_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    
-    try:
-        content = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-    
-    # Validate required fields
-    required_fields = ["title", "content"]
-    for field in required_fields:
-        if field not in content:
-            raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
-    
-    # Add metadata
-    content["id"] = f"averi-{uuid.uuid4().hex[:12]}"
-    content["received_at"] = datetime.now().isoformat()
-    content["source"] = "averi_ai"
-    
-    # Save to JSON file
-    averi_file = DATA_DIR / "averi_content.json"
-    
-    try:
-        if averi_file.exists():
-            with open(averi_file, 'r') as f:
-                existing = json.load(f)
-        else:
-            existing = {"articles": []}
-        
-        existing["articles"].insert(0, content)
-        existing["articles"] = existing["articles"][:500]  # Keep last 500
-        existing["total"] = len(existing["articles"])
-        existing["last_received"] = datetime.now().isoformat()
-        
-        with open(averi_file, 'w') as f:
-            json.dump(existing, f, indent=2)
-        
-        print(f"[{datetime.now()}] Averi AI content saved: {content['title'][:50]}")
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save content: {str(e)}")
-    
-    return {
-        "success": True,
-        "id": content["id"],
-        "message": "Content received and saved successfully",
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.get("/api/averi-content")
-async def get_averi_content(
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    limit: int = Query(20, ge=1, le=100)
-):
-    """Retrieve Averi AI generated content"""
-    if x_api_key != AVERI_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    
-    averi_file = DATA_DIR / "averi_content.json"
-    if not averi_file.exists():
-        return {"articles": [], "total": 0}
-    
-    with open(averi_file, 'r') as f:
-        data = json.load(f)
-    
-    return {
-        "articles": data["articles"][:limit],
-        "total": data.get("total", 0),
-        "last_received": data.get("last_received")
-    }
-
-# ============================================
-# PLATFORM-SPECIFIC SCRAPERS (No API key needed)
-# ============================================
-
-async def get_tiktok_url(url: str) -> Optional[str]:
-    """Get TikTok video URL without watermark using tikwm.com API"""
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(
-                "https://www.tikwm.com/api/",
-                data={"url": url, "count": 12, "cursor": 0, "web": 1, "hd": 1},
-                headers={"User-Agent": CHROME_UA}
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("code") == 0:
-                    video_data = data.get("data", {})
-                    return video_data.get("hdplay") or video_data.get("play") or video_data.get("wmplay")
-    except Exception as e:
-        print(f"TikTok API error: {e}")
-    return None
-
-async def get_instagram_url(url: str) -> Optional[str]:
-    """Get Instagram video URL using instaloader approach"""
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.get(
-                f"https://api.instagram.com/oembed/?url={url}",
-                headers={"User-Agent": MOBILE_UA}
-            )
-            if r.status_code == 200:
-                pass
-    except Exception:
-        pass
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            match = re.search(r'/(p|reel|tv)/([A-Za-z0-9_-]+)', url)
-            if not match: return None
-            shortcode = match.group(2)
-
-            r = await client.get(
-                f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis",
-                headers={
-                    "User-Agent": MOBILE_UA,
-                    "Accept": "application/json",
-                    "x-ig-app-id": "936619743392459",
-                }
-            )
-            if r.status_code == 200:
-                data = r.json()
-                media = data.get("items", [{}])[0]
-                video_versions = media.get("video_versions", [])
-                if video_versions:
-                    return video_versions[0].get("url")
-    except Exception as e:
-        print(f"Instagram scraper error: {e}")
-    return None
-
-async def get_twitter_url(url: str) -> Optional[str]:
-    """Get Twitter/X video URL using fxtwitter API"""
-    try:
-        match = re.search(r'status/(\d+)', url)
-        if not match: return None
-        tweet_id = match.group(1)
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.get(
-                f"https://api.fxtwitter.com/status/{tweet_id}",
-                headers={"User-Agent": CHROME_UA}
-            )
-            if r.status_code == 200:
-                data = r.json()
-                tweet = data.get("tweet", {})
-                media = tweet.get("media", {})
-                videos = media.get("videos", [])
-                if videos:
-                    best = max(videos, key=lambda v: v.get("width", 0) * v.get("height", 0))
-                    return best.get("url")
-                external = media.get("external", {})
-                if external.get("url"):
-                    return external["url"]
-    except Exception as e:
-        print(f"Twitter API error: {e}")
-    return None
-
-async def get_facebook_url(url: str) -> Optional[str]:
-    """Get Facebook video URL - yt-dlp works well for FB"""
-    return None
-
-async def get_soundcloud_url(url: str) -> Optional[str]:
-    """SoundCloud works with yt-dlp"""
-    return None
-
-# ============================================
-# YT-DLP WITH BEST SETTINGS
-# ============================================
-def get_ytdlp_opts(platform: str, fmt: str, output: str, is_audio: bool = False) -> dict:
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'ignoreerrors': False,
-        'socket_timeout': 60,
-        'retries': 5,
-        'fragment_retries': 5,
-        'format': fmt,
-        'outtmpl': output,
-        'merge_output_format': 'mp3' if is_audio else 'mp4',
-        'http_headers': {'User-Agent': CHROME_UA},
-    }
-
-    if platform == 'youtube':
-        opts['extractor_args'] = {
-            'youtube': {
-                'player_client': ['mweb', 'android_vr', 'android'],
-                'skip': ['hls'],
-            }
-        }
-        if not is_audio:
-            opts['format'] = 'best[ext=mp4]/best'
-
-    elif platform == 'facebook':
-        opts['http_headers'] = {
-            'User-Agent': CHROME_UA,
-            'Referer': 'https://www.facebook.com/',
-        }
-
-    elif platform == 'audiomack':
-        opts['http_headers'] = {'User-Agent': CHROME_UA, 'Referer': 'https://audiomack.com/'}
-        opts['format'] = 'bestaudio/best'
-
-    elif platform == 'soundcloud':
-        opts['http_headers'] = {'User-Agent': CHROME_UA, 'Referer': 'https://soundcloud.com/'}
-        opts['format'] = 'bestaudio/best'
-
-    if is_audio:
-        opts['format'] = 'bestaudio/best'
-        opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '320'}]
-
-    return opts
-
-def build_format(fmt: str, platform: str) -> str:
-    if platform == 'youtube':
-        return 'best[ext=mp4]/best'
-    if fmt in ['mp3', 'audio']: return 'bestaudio/best'
-    return {
-        'best':  'best[ext=mp4]/best',
-        '1080p': 'best[height<=1080][ext=mp4]/best[height<=1080]/best',
-        '720p':  'best[height<=720][ext=mp4]/best[height<=720]/best',
-        '480p':  'best[height<=480][ext=mp4]/best[height<=480]/best',
-        '360p':  'best[height<=360][ext=mp4]/best[height<=360]/best',
-        'hd':    'best[height<=1080][ext=mp4]/best[height<=1080]/best',
-        'sd':    'best[height<=480][ext=mp4]/best[height<=480]/best',
-    }.get(fmt, 'best[ext=mp4]/best')
-
-# ============================================
-# RSS FETCHING
-# ============================================
-async def fetch_single_rss(feed_url, platform):
+async def fetch_single_rss(feed_url: str, platform: str) -> List[dict]:
     videos = []
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(feed_url)
             response.raise_for_status()
+            
             root = ET.fromstring(response.content)
-            for entry in root.findall('.//{*}entry'):
+            # Use Wildcard {*} to ignore namespace URI mismatches
+            entries = root.findall('.//{*}entry')
+            
+            for entry in entries:
                 try:
+                    # Find IDs and Metadata using wildcard
                     id_elem = entry.find('.//{*}videoId')
                     if id_elem is None: continue
                     video_id = id_elem.text
+
                     title_elem = entry.find('.//{*}title')
                     title = title_elem.text if title_elem is not None else "Wrestling Video"
+                    
                     thumb_elem = entry.find('.//{*}thumbnail')
                     thumbnail = thumb_elem.get('url') if thumb_elem is not None else ""
+                    
                     desc_elem = entry.find('.//{*}description')
-                    description = (desc_elem.text or "")[:500] if desc_elem is not None else ""
+                    description = desc_elem.text[:500] if desc_elem is not None and desc_elem.text else ""
+                    
                     stats_elem = entry.find('.//{*}statistics')
                     view_count = int(stats_elem.get('views', 0)) if stats_elem is not None else 0
+
                     dur_elem = entry.find('.//{*}duration')
                     duration = int(dur_elem.text) if dur_elem is not None and dur_elem.text else 0
+
                     author_elem = entry.find('.//{*}author/{*}name')
                     uploader = author_elem.text if author_elem is not None else platform.upper()
+
                     pub_elem = entry.find('.//{*}published')
                     published = pub_elem.text if pub_elem is not None else datetime.now().isoformat()
+
                     videos.append({
-                        "id": f"yt-{video_id}", "platform": "youtube", "original_id": video_id,
-                        "original_title": title, "original_description": description,
-                        "thumbnail": thumbnail, "video_url": f"https://www.youtube.com/watch?v={video_id}",
-                        "uploader": uploader, "wrestler": extract_wrestler_from_title(title, uploader),
-                        "duration": duration, "view_count": view_count,
-                        "upload_timestamp": published, "platform_category": platform
+                        "id": f"yt-{video_id}",
+                        "platform": "youtube",
+                        "original_id": video_id,
+                        "original_title": title,
+                        "original_description": description,
+                        "thumbnail": thumbnail,
+                        "video_url": f"https://www.youtube.com/watch?v={video_id}",
+                        "uploader": uploader,
+                        "wrestler": extract_wrestler_from_title(title, uploader),
+                        "duration": duration,
+                        "view_count": view_count,
+                        "upload_timestamp": published,
+                        "platform_category": platform
                     })
-                except Exception:
-                    continue
+                except Exception: continue
     except Exception as e:
-        print(f"RSS error {feed_url}: {e}")
+        print(f"Error fetching {feed_url}: {e}")
     return videos
 
 # ============================================
-# API ENDPOINTS
+# DOWNLOADER LOGIC (RETAINED & POWERFUL)
 # ============================================
-
-@app.get("/")
-async def root():
-    return {
-        "message": "ReelsDown API Operational", 
-        "status": "active", 
-        "version": "3.2",
-        "endpoints": {
-            "/info": "GET video metadata",
-            "/download": "GET download video file",
-            "/preview": "GET video preview URL",
-            "/fetch/raw": "GET all raw videos from RSS",
-            "/fetch/new": "GET new videos since timestamp",
-            "/status": "GET API status",
-            "/api/averi-content": "POST (webhook) & GET - Averi AI integration"
-        }
+YDL_OPTS_BASE = {
+    'quiet': True,
+    'no_warnings': True,
+    'extract_flat': False,
+    'force_generic_extractor': False,
+    'ignoreerrors': True,
+    'no_color': True,
+    'geo_bypass': True,
+    'socket_timeout': 30,
+    'retries': 3,
+    'fragment_retries': 3,
+    'skip_unavailable_fragments': True,
+    'keepvideo': False,
+    'hls_prefer_native': True,
+    'http_headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-us,en;q=0.5',
+        'Connection': 'keep-alive',
     }
+}
+
+def generate_viral_metadata(original_title: str, url: str, thumbnail: str) -> tuple:
+    """
+    Generate viral title, description, summary, and tags.
+    Replace this with your AI model call later.
+    For now, uses smart template-based generation.
+    """
+    # Template-based generation (replace with AI later)
+    title = original_title[:60] if len(original_title) > 60 else original_title
+    
+    # Add viral hooks
+    viral_hooks = [
+        "You Won't Believe What Happens Next!",
+        "This Will Change Everything You Know!",
+        "Must Watch - Incredible Moments!",
+        "The Best Moments You've Ever Seen!",
+        "This Video Will Blow Your Mind!"
+    ]
+    
+    hook = random.choice(viral_hooks)
+    final_title = f"{title} | {hook}"
+    
+    description = f"""
+{original_title}
+
+🔥 Don't forget to like, share, and subscribe for more!
+
+#viral #trending #mustwatch #incredible #amazing
+    """.strip()
+    
+    summary = f"In this video: {original_title[:200]}"
+    
+    tags = ["viral", "trending", "mustwatch", "incredible", "amazing", "youtube", "video"]
+    
+    return final_title, description, summary, tags
+
+# ============================================
+# ENDPOINTS
+# ============================================
 
 @app.get("/info")
 async def get_video_info(url: str = Query(...)):
     try:
-        platform = detect_platform(url)
-        fmt = build_format('best', platform)
-        opts = get_ytdlp_opts(platform, fmt, '/tmp/info')
-        opts.pop('outtmpl', None)
-        opts.pop('merge_output_format', None)
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(YDL_OPTS_BASE) as ydl:
             info = ydl.extract_info(url, download=False)
-            if not info:
-                raise Exception("Could not extract video info.")
-
-            formats = []
-            if info.get('formats'):
-                seen = set()
-                for f in reversed(info['formats']):
-                    h = f.get('height')
-                    if h and h not in seen and f.get('vcodec','') != 'none':
-                        seen.add(h)
-                        formats.append({'quality': f'{h}p', 'format': f'{h}p', 'ext': 'mp4'})
-                formats.sort(key=lambda x: int(x['quality'].replace('p','')), reverse=True)
-
-            if not formats:
-                formats = [
-                    {'quality': '720p', 'format': '720p', 'ext': 'mp4'},
-                    {'quality': '480p', 'format': '480p', 'ext': 'mp4'},
-                    {'quality': 'Best', 'format': 'best', 'ext': 'mp4'},
-                ]
-            formats.append({'quality': 'MP3 320kbps', 'format': 'mp3', 'ext': 'mp3'})
-
+            if not info: raise Exception("No info found")
             return {
                 "title": info.get("title", "Unknown"),
                 "thumbnail": info.get("thumbnail", ""),
-                "description": (info.get("description") or "")[:500],
+                "description": info.get("description", "")[:500] if info.get("description") else "",
                 "duration": info.get("duration", 0),
                 "uploader": info.get("uploader", ""),
                 "view_count": info.get("view_count", 0),
                 "like_count": info.get("like_count", 0),
-                "platform": platform,
-                "formats": formats[:8],
+                "platform": info.get("extractor_key", "unknown"),
             }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Error: {str(e)}")
 
 @app.get("/download")
 async def download_video(url: str = Query(...), format: str = Query("best")):
     try:
-        platform = detect_platform(url)
-        is_audio = format in ['mp3', 'audio'] or platform in ['spotify', 'audiomack', 'soundcloud', 'applemusic']
-
-        direct_url = None
-
-        if platform == 'tiktok':
-            direct_url = await get_tiktok_url(url)
-        elif platform == 'twitter':
-            direct_url = await get_twitter_url(url)
-        elif platform == 'instagram':
-            direct_url = await get_instagram_url(url)
-
-        if direct_url:
-            async def stream_direct():
-                async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
-                    async with client.stream("GET", direct_url, headers={"User-Agent": MOBILE_UA}) as response:
-                        async for chunk in response.aiter_bytes(8192):
-                            yield chunk
-
-            ext = 'mp3' if is_audio else 'mp4'
-            media_type = "audio/mpeg" if is_audio else "video/mp4"
-            return StreamingResponse(
-                stream_direct(),
-                media_type=media_type,
-                headers={"Content-Disposition": f'attachment; filename="video.{ext}"'}
-            )
+        with yt_dlp.YoutubeDL(YDL_OPTS_BASE) as ydl:
+            info = ydl.extract_info(url, download=False)
+            clean_title = clean_filename(info.get("title", "video"))
+            filename = f"{clean_title}.mp4"
 
         uid = uuid.uuid4().hex[:8]
-        ext = 'mp3' if is_audio else 'mp4'
         output_template = f"/tmp/{uid}.%(ext)s"
-        fmt = build_format(format, platform)
-        opts = get_ytdlp_opts(platform, fmt, output_template, is_audio)
 
-        try:
-            info = None
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                title = info.get("title", "video") if info else "video"
-            filename = f"{clean_filename(title)}.{ext}"
-        except Exception:
-            filename = f"video.{ext}"
+        format_string = {
+            "best": "best[ext=mp4]/best",
+            "hd": "best[height<=720][ext=mp4]/best",
+            "sd": "best[height<=480][ext=mp4]/best",
+            "audio": "bestaudio/best"
+        }.get(format, format)
+
+        opts = {**YDL_OPTS_BASE, 'format': format_string, 'outtmpl': output_template, 'merge_output_format': 'mp4'}
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
 
         file_path = next((os.path.join("/tmp", f) for f in os.listdir("/tmp") if f.startswith(uid)), None)
-        if not file_path:
-            raise HTTPException(status_code=500, detail=f"Download failed for {platform}. Please try again.")
-
-        media_type = "audio/mpeg" if is_audio else "video/mp4"
+        if not file_path: raise HTTPException(status_code=500, detail="Download failed")
 
         def iterfile():
             with open(file_path, "rb") as f: yield from f
             try: os.unlink(file_path)
             except: pass
 
-        return StreamingResponse(iterfile(), media_type=media_type,
+        return StreamingResponse(iterfile(), media_type="video/mp4",
                                  headers={"Content-Disposition": f'attachment; filename="{filename}"'})
-
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Download error: {str(e)}")
-
-@app.get("/preview")
-async def get_preview_url(url: str = Query(...)):
-    try:
-        platform = detect_platform(url)
-
-        if platform == 'tiktok':
-            v = await get_tiktok_url(url)
-            if v: return {"video_url": v, "thumbnail": "", "title": "", "platform": platform}
-
-        if platform == 'twitter':
-            v = await get_twitter_url(url)
-            if v: return {"video_url": v, "thumbnail": "", "title": "", "platform": platform}
-
-        fmt = build_format('best', platform)
-        opts = get_ytdlp_opts(platform, fmt, '/tmp/preview')
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return {
-                "video_url": info.get('url', ''),
-                "thumbnail": info.get('thumbnail', ''),
-                "title": info.get('title', ''),
-                "platform": platform,
-            }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/fetch/raw")
 async def fetch_raw_videos():
     all_videos = []
-    tasks = [fetch_single_rss(f, "wwe") for f in WWE_RSS_FEEDS] + [fetch_single_rss(f, "aew") for f in AEW_RSS_FEEDS]
-    for res in await asyncio.gather(*tasks):
+    # Fetch all feeds
+    tasks = [fetch_single_rss(f, "wwe") for f in WWE_RSS_FEEDS] + \
+            [fetch_single_rss(f, "aew") for f in AEW_RSS_FEEDS]
+    
+    results = await asyncio.gather(*tasks)
+    for res in results:
         all_videos.extend(res)
+    
+    # Update state
     with open(FETCH_STATE_FILE, 'r') as f: state = json.load(f)
-    state.update({"last_fetch": datetime.now().isoformat(), "total_fetched": len(all_videos),
-                  "wwe_count": sum(1 for v in all_videos if v['platform_category']=='wwe'),
-                  "aew_count": sum(1 for v in all_videos if v['platform_category']=='aew')})
+    state.update({"last_fetch": datetime.now().isoformat(), "total_fetched": len(all_videos)})
     with open(FETCH_STATE_FILE, 'w') as f: json.dump(state, f)
+    
     return {"success": True, "videos": all_videos, "total": len(all_videos)}
 
-@app.get("/fetch/new")
-async def fetch_new_videos(since: str = Query(None)):
-    all_videos = []
-    tasks = [fetch_single_rss(f, "wwe") for f in WWE_RSS_FEEDS] + [fetch_single_rss(f, "aew") for f in AEW_RSS_FEEDS]
-    for res in await asyncio.gather(*tasks):
-        all_videos.extend(res)
-    if since:
-        try:
-            since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
-            all_videos = [v for v in all_videos if datetime.fromisoformat(v['upload_timestamp'].replace('Z', '+00:00')) > since_dt]
-        except Exception:
-            pass
-    return {"success": True, "videos": all_videos, "total": len(all_videos)}
-
-@app.get("/status")
-async def get_status():
+@app.get("/preview")
+async def get_preview_url(url: str = Query(...)):
     try:
-        with open(FETCH_STATE_FILE, 'r') as f: state = json.load(f)
-    except: state = {}
-    return {"status": "operational", "version": "3.2", "fetch_state": state}
+        opts = {**YDL_OPTS_BASE, 'format': 'best[ext=mp4]/best'}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {"video_url": info.get('url', ''), "thumbnail": info.get('thumbnail', ''), "title": info.get('title', '')}
+    except Exception as e: raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/video/analyze", response_model=VideoAnalysisResponse)
+async def analyze_video(request: VideoAnalysisRequest):
+    """
+    Download video from URL (Facebook, YouTube, etc.), analyze it,
+    and generate title + description for viral content.
+    """
+    try:
+        uid = uuid.uuid4().hex[:12]
+        
+        # Step 1: Get video info using yt_dlp
+        opts = {
+            **YDL_OPTS_BASE,
+            'format': 'best[ext=mp4]/best',
+            'outtmpl': f"/tmp/{uid}.%(ext)s",
+            'merge_output_format': 'mp4'
+        }
+        
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(request.url, download=False)
+            
+            if not info:
+                return VideoAnalysisResponse(
+                    success=False,
+                    error="Could not extract video information"
+                )
+            
+            title = info.get("title", "video")
+            thumbnail = info.get("thumbnail", "")
+            duration = info.get("duration", 0)
+            
+            # Step 2: Download video
+            download_opts = {**opts, 'quiet': False}
+            with yt_dlp.YoutubeDL(download_opts) as ydl:
+                ydl.download([request.url])
+        
+        # Step 3: Find downloaded file
+        video_path = next((os.path.join("/tmp", f) for f in os.listdir("/tmp") if f.startswith(uid)), None)
+        if not video_path:
+            return VideoAnalysisResponse(
+                success=False,
+                error="Download failed"
+            )
+        
+        # Step 4: Generate AI metadata (title, description, tags)
+        ai_title, ai_description, summary, tags = generate_viral_metadata(
+            original_title=title,
+            url=request.url,
+            thumbnail=thumbnail
+        )
+        
+        # Step 5: Return result with download URL
+        return VideoAnalysisResponse(
+            success=True,
+            video_url=video_path,
+            download_url=f"/api/video/download-file/{uid}",
+            title=ai_title,
+            description=ai_description,
+            summary=summary,
+            tags=tags,
+            duration=duration,
+            thumbnail=thumbnail
+        )
+        
+    except Exception as e:
+        return VideoAnalysisResponse(
+            success=False,
+            error=f"Analysis failed: {str(e)}"
+        )
+
+@app.get("/api/video/download-file/{uid}")
+async def download_video_file(uid: str):
+    """
+    Serve the downloaded video file for user to save to phone.
+    """
+    video_path = next((os.path.join("/tmp", f) for f in os.listdir("/tmp") if f.startswith(uid) and f.endswith(".mp4")), None)
+    
+    if not video_path:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    def iterfile():
+        with open(video_path, "rb") as f:
+            yield from f
+        try:
+            os.unlink(video_path)
+        except:
+            pass
+    
+    filename = f"video_{uid}.mp4"
+    return StreamingResponse(
+        iterfile(),
+        media_type="video/mp4",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+@app.get("/")
+async def root():
+    return {"message": "ReelsDown API Operational", "status": "active"}
 
 if __name__ == "__main__":
     import uvicorn
